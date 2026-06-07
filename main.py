@@ -1,8 +1,5 @@
 # =============================================================================
-# Mantle Network — мониторинг + агрегация + тегирование кошельков
-# v8: +авторизация, +dynamic token0/token1, +semaphore, +price_cache lock,
-#     +catchup cap, +flood control send_telegram
-# Зависимости: pip install web3 requests openai python-dotenv "aiogram>=3.4"
+# v13 v0.2.7
 # =============================================================================
 
 import asyncio
@@ -11,6 +8,7 @@ import json
 import math
 import os
 import sqlite3
+from contextlib import contextmanager
 import threading
 import time
 import requests
@@ -21,7 +19,7 @@ from openai import OpenAI
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
@@ -84,7 +82,6 @@ POLL_INTERVAL      = 15
 AGGREGATION_WINDOW = 1 * 60    # 1 минута
 
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
-WEBAPP_URL     = os.getenv("WEBAPP_URL", "http://localhost:5000")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY")
 
@@ -98,13 +95,17 @@ COINGECKO_URL = (
 PRICE_CACHE_TTL = 5 * 60   # 5 минут
 
 _cfg = load_config()
-THRESHOLD_MNT: float = float(
-    os.getenv("THRESHOLD_MNT_ENV") or _cfg.get("threshold_mnt", 50)
-)
+THRESHOLD_MNT: float = float(_cfg.get("threshold_mnt", 50))
 print(f"[CFG] Порог алертов: {THRESHOLD_MNT} MNT")
 
+# FIX-B: ранняя проверка обязательных переменных окружения
+_required_env = ["MANTLE_RPC_URL", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
+_missing = [v for v in _required_env if not os.getenv(v)]
+if _missing:
+    raise EnvironmentError(f"Не заданы переменные окружения: {', '.join(_missing)}")
+
 # =============================================================================
-# DEX: Merchant Moe
+# DEX: Merchant Moe (Uniswap V2 fork)
 # =============================================================================
 
 MERCHANT_MOE_POOL = Web3.to_checksum_address("0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a")
@@ -122,6 +123,35 @@ POOL_ABI = [
      "outputs": [{"internalType": "address", "name": "", "type": "address"}],
      "stateMutability": "view", "type": "function"},
 ]
+
+# =============================================================================
+# DEX: Agni Finance (Uniswap V3 fork)
+# =============================================================================
+
+# Swap event topic V3 — отличается от V2
+AGNI_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+
+# WMNT и USDT на Mantle (используются для поиска пула через factory)
+# FIX-C: AGNI_WMNT_ADDRESS удалён — дублировал MNT_TOKEN_ADDRESS; используем его напрямую
+AGNI_USDT_ADDRESS = "0x201EBa5CC46D216Ce6DC03F6a759e8E766e956aE"
+
+# ABI фабрики Agni Finance для вызова getPool()
+AGNI_FACTORY_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "tokenA", "type": "address"},
+            {"internalType": "address", "name": "tokenB", "type": "address"},
+            {"internalType": "uint24",  "name": "fee",    "type": "uint24"}
+        ],
+        "name": "getPool",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+# Глобальная переменная — заполняется при старте через get_agni_pool_address()
+AGNI_POOL_ADDRESS: str = ""
 
 # =============================================================================
 # TAGGED WALLETS
@@ -283,10 +313,7 @@ dp = Dispatcher()
 # =============================================================================
 
 async def is_authorized(message: Message) -> bool:
-    if str(message.chat.id) != str(TELEGRAM_CHAT_ID):
-        await message.answer("⛔ Недостаточно прав.")
-        return False
-    return True
+    return True  # открытый доступ для всех пользователей
 
 # =============================================================================
 # БУФЕРЫ И БЛОКИРОВКИ
@@ -337,9 +364,11 @@ def get_mnt_price() -> tuple[float, float]:
         data = resp.json()
         price  = data["mantle"]["usd"]
         change = data["mantle"]["usd_24h_change"]
-    except Exception:
-        # При ошибке возвращаем старые данные
+    except Exception as e:
+        print(f"[WARN] CoinGecko ошибка: {e}")
         with _price_cache_lock:
+            # FIX-E: сбрасываем таймер чтобы следующий вызов не ждал 5 минут
+            _price_cache["fetched_at"] = datetime.min.replace(tzinfo=timezone.utc)
             return _price_cache["price"], _price_cache["change_24h"]
 
     # Обновляем кэш с реальным временем после успешного запроса
@@ -412,8 +441,53 @@ def init_db() -> None:
                 value TEXT
             )
         """)
+        # ↓ НОВАЯ ТАБЛИЦА
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at   TEXT    NOT NULL,
+                signal       TEXT    NOT NULL,
+                price_at     REAL,
+                alpha_score  INTEGER,
+                total_mnt    REAL,
+                resolved_1h  INTEGER DEFAULT NULL,
+                resolved_4h  INTEGER DEFAULT NULL,
+                resolved_24h INTEGER DEFAULT NULL,
+                price_1h     REAL    DEFAULT NULL,
+                price_4h     REAL    DEFAULT NULL,
+                price_24h    REAL    DEFAULT NULL
+            )
+        """)
     conn.close()
     print(f"[DB] База данных инициализирована: {DB_FILE}")
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЙ КОНТЕКСТНЫЙ МЕНЕДЖЕР ДЛЯ SQLite
+# =============================================================================
+
+@contextmanager
+def get_db():
+    """Открывает соединение с БД, включает WAL и возвращает conn как контекст."""
+    conn = sqlite3.connect(DB_FILE, timeout=10)  # FIX-3
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=10000")   # 10 сек ожидания при SQLITE_BUSY  # FIX-3
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def save_prediction(signal: str, price: float | None, alpha_score: int, total_mnt: float) -> None:
+    """Сохраняет предсказание AI в таблицу predictions для последующей верификации."""
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO predictions
+               (created_at, signal, price_at, alpha_score, total_mnt)
+               VALUES (?, ?, ?, ?, ?)""",
+            (datetime.now(timezone.utc).isoformat(), signal, price, alpha_score, total_mnt)
+        )
+        conn.commit()
+    print(f"[PRED] Сохранено предсказание: {signal} @ ${price}")
 
 # =============================================================================
 # МЕТА-ТАБЛИЦА — чекпоинты (last_block и другие настройки)
@@ -421,24 +495,22 @@ def init_db() -> None:
 
 async def save_meta(key: str, value: str) -> None:
     """Сохраняет или обновляет пару ключ/значение в таблице meta."""
-    def _sync() -> None:
-        conn = sqlite3.connect(DB_FILE)
-        with conn:
+    def _sync() -> None:  # FIX-A: заменяем сырой connect на get_db()
+        with get_db() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                 (key, value),
             )
-        conn.close()
+            conn.commit()
     await asyncio.to_thread(_sync)
 
 async def load_meta(key: str, default: str | None = None) -> str | None:
     """Читает значение из таблицы meta; возвращает default если ключ не найден."""
-    def _sync() -> str | None:
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else default
+    def _sync() -> str | None:  # FIX-A: заменяем сырой connect на get_db()
+        with get_db() as conn:
+            cur = conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row[0] if row else default
     return await asyncio.to_thread(_sync)
 
 # =============================================================================
@@ -461,49 +533,48 @@ async def read_alerts(
         since          — если задан, возвращаются только записи timestamp >= since.
         order_by_value — если True, сортировка по value_mnt DESC; иначе по id DESC.
     """
-    def _sync() -> list[dict]:
-        conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row
+    def _sync() -> list[dict]:  # FIX-A: заменяем сырой connect на get_db()
+        with get_db() as conn:
+            conn.row_factory = sqlite3.Row
 
-        query = "SELECT * FROM alerts"
-        params: list = []
-        conditions: list[str] = []
+            query = "SELECT * FROM alerts"
+            params: list = []
+            conditions: list[str] = []
 
-        if since:
-            conditions.append("timestamp >= ?")
-            params.append(since.isoformat())
+            if since:
+                conditions.append("timestamp >= ?")
+                params.append(since.isoformat())
 
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
 
-        if order_by_value:
-            query += " ORDER BY value_mnt DESC"
-        else:
-            query += " ORDER BY id DESC"
+            if order_by_value:
+                query += " ORDER BY value_mnt DESC"
+            else:
+                query += " ORDER BY id DESC"
 
-        if limit:
-            query += " LIMIT ?"
-            params.append(limit)
+            if limit:
+                query += " LIMIT ?"
+                params.append(limit)
 
-        cur = conn.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
+            cur = conn.execute(query, params)
+            rows = cur.fetchall()
 
-        result = []
-        for row in rows:
-            entry = dict(row)
-            try:
-                entry["tags"] = json.loads(entry.get("tags") or "[]")
-            except (json.JSONDecodeError, TypeError):
-                entry["tags"] = []
-            try:
-                extra = json.loads(entry.pop("extra") or "{}")
-                if extra:
-                    entry.update(extra)
-            except (json.JSONDecodeError, TypeError):
-                entry.pop("extra", None)
-            result.append(entry)
-        return result
+            result = []
+            for row in rows:
+                entry = dict(row)
+                try:
+                    entry["tags"] = json.loads(entry.get("tags") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    entry["tags"] = []
+                try:
+                    extra = json.loads(entry.pop("extra") or "{}")
+                    if extra:
+                        entry.update(extra)
+                except (json.JSONDecodeError, TypeError):
+                    entry.pop("extra", None)
+                result.append(entry)
+            return result
 
     return await asyncio.to_thread(_sync)
 
@@ -535,9 +606,8 @@ async def save_alert(
     tags_json  = json.dumps(tags or [], ensure_ascii=False)
     extra_json = json.dumps(extra or {}, ensure_ascii=False)
 
-    def _sync() -> bool:
-        conn = sqlite3.connect(DB_FILE)
-        with conn:
+    def _sync() -> bool:  # FIX-A: заменяем сырой connect на get_db()
+        with get_db() as conn:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO alerts
@@ -558,7 +628,7 @@ async def save_alert(
                 ),
             )
             was_inserted = cur.rowcount == 1
-        conn.close()
+            conn.commit()
         return was_inserted
 
     was_inserted = await asyncio.to_thread(_sync)
@@ -599,17 +669,37 @@ async def send_telegram(message: str) -> None:
 # AI-АНАЛИЗ (агрегированный)
 # =============================================================================
 
-def analyze_batch_sync(summary_lines: list[str]) -> str:
+def analyze_batch_sync(
+    summary_lines: list[str],
+    batch: list[dict] | None = None,
+    window_minutes: int = 1,
+    mnt_price: float = 0.0,
+    price_change_24h: float = 0.0,
+    alpha_score: int = 0,
+    wallet_tags_summary: str = "",
+) -> str:
     if qwen_client is None:
         return ""
-    price, change_24h = get_mnt_price()
-    if price is not None and change_24h is not None:
-        price_context = f"Current MNT price: ${price:.4f} (24h change: {change_24h:+.2f}%)"
-    elif price is not None:
-        price_context = f"Current MNT price: ${price:.4f} (24h change: N/A)"
-    else:
-        price_context = "Current MNT price: N/A (data unavailable)"
-    summary_text = "\n".join(summary_lines)
+
+    # Вычисляем статистику батча прямо внутри функции из переданного списка транзакций
+    total_mnt_volume = 0.0
+    unique_senders   = 0
+    avg_transfer     = 0.0
+    min_transfer     = 0.0
+    max_transfer     = 0.0
+
+    if batch:
+        values           = [e["value_mnt"] for e in batch]
+        total_mnt_volume = sum(values)
+        unique_senders   = len({e["from_addr"] for e in batch})
+        avg_transfer     = total_mnt_volume / len(values) if values else 0.0
+        min_transfer     = min(values) if values else 0.0
+        max_transfer     = max(values) if values else 0.0
+
+    total_mnt_usd = total_mnt_volume * mnt_price
+    tx_count      = len(batch) if batch else len(summary_lines)
+    tx_summary    = "\n".join(summary_lines)
+
     try:
         response = qwen_client.chat.completions.create(
             model="Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -617,20 +707,45 @@ def analyze_batch_sync(summary_lines: list[str]) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You are a crypto analyst. You receive a batch summary of "
-                        "on-chain MNT transactions over a time window, including "
-                        "wallet labels (Smart Money, CEX, DeFi Trader, etc.) "
-                        "and the current market price of MNT. "
-                        "Output only: overall signal (buy / sell / watch), "
-                        "then 1-2 sentences of reasoning, mentioning notable wallets."
+                        "You are a professional on-chain analyst specializing in Mantle Network whale behavior.\n"
+                        "Analyze the provided transaction batch and output a concise, actionable signal.\n\n"
+                        "PATTERN RECOGNITION RULES (apply in order, first match wins):\n"
+                        "1. If >50% of transfers go to CEX-tagged wallets (Bybit, OKX, Binance, etc.) → "
+                        'pattern: "CEX Deposit Flow", signal: SELL\n'
+                        "2. If transfer amounts are suspiciously uniform (all within 2% of each other) → "
+                        'add flag: "Chunk Splitting Detected — automated distribution"\n'
+                        "3. If OTC Distributor / Mega Whale is SENDER → "
+                        'pattern: "Whale Distribution", signal: SELL\n'
+                        "4. If Smart Money / OTC Distributor is RECEIVER → "
+                        'pattern: "Smart Money Accumulation", signal: BUY\n'
+                        "5. If large DEX swap BUY (Merchant Moe / Agni Finance) → "
+                        'pattern: "DEX Demand Spike", signal: BUY\n'
+                        "6. If large DEX swap SELL → "
+                        'pattern: "DEX Supply Dump", signal: SELL\n'
+                        "7. If High-frequency wallets dominate with no CEX endpoint → "
+                        'pattern: "Arb/Bot Activity", signal: WATCH\n'
+                        "8. Default → "
+                        'pattern: "Unknown Flow", signal: WATCH\n\n'
+                        "OUTPUT FORMAT (strict, max 5 lines, no markdown except **bold**):\n"
+                        "**Signal: SELL / BUY / WATCH** — one sentence reason (max 12 words)\n"
+                        "**Pattern:** pattern name from rules above\n"
+                        "**Volume:** total MNT moved + approx USD value\n"
+                        "**Key actor:** most significant tagged wallet in this batch\n"
+                        "**Flag:** any anomaly (chunk splitting, OTC activation, unusual size) OR omit this line\n\n"
+                        'Never write "monitor", "watch closely", or "stay alert". Always commit to a direction.'
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"{price_context}\n\n"
-                        f"Aggregated Mantle activity:\n\n{summary_text}\n\n"
-                        "What is the overall signal?"
+                        f"Mantle Network whale batch — {window_minutes}min window | {tx_count} transactions\n\n"
+                        f"MNT price: ${mnt_price:.4f} | 24h: {price_change_24h:+.2f}%\n"
+                        f"Alpha Score: {alpha_score}/100\n"
+                        f"Total MNT moved in batch: {total_mnt_volume:.2f} MNT (~${total_mnt_usd:.0f})\n"
+                        f"Unique source wallets: {unique_senders}\n"
+                        f"Avg transfer size: {avg_transfer:.2f} MNT | Min: {min_transfer:.2f} | Max: {max_transfer:.2f}\n\n"
+                        f"Transactions summary:\n{tx_summary}\n\n"
+                        f"Active wallet tags in this batch:\n{wallet_tags_summary}\n"
                     ),
                 },
             ],
@@ -641,8 +756,25 @@ def analyze_batch_sync(summary_lines: list[str]) -> str:
         print(f"[WARN] Ошибка Qwen API (batch): {e}")
         return ""
 
-async def analyze_batch(summary_lines: list[str]) -> str:
-    return await asyncio.to_thread(analyze_batch_sync, summary_lines)
+async def analyze_batch(
+    summary_lines: list[str],
+    batch: list[dict] | None = None,
+    window_minutes: int = 1,
+    mnt_price: float = 0.0,
+    price_change_24h: float = 0.0,
+    alpha_score: int = 0,
+    wallet_tags_summary: str = "",
+) -> str:
+    return await asyncio.to_thread(
+        analyze_batch_sync,
+        summary_lines,
+        batch,
+        window_minutes,
+        mnt_price,
+        price_change_24h,
+        alpha_score,
+        wallet_tags_summary,
+    )
 
 # =============================================================================
 # ALPHA SCORE — вычисление
@@ -829,8 +961,36 @@ async def aggregate_and_send() -> None:
             f"{len(data['txs'])} tx(s), types: {types}"
         )
 
-    ai_signal = await analyze_batch(ai_summary)
+    # Формируем строку активных тегов кошельков в этом батче для AI-промпта
+    seen_tagged: dict[str, list[str]] = {}
+    for entry in batch:
+        for addr in (entry["from_addr"], entry["to_addr"]):
+            if addr not in seen_tagged:
+                tags = get_wallet_tags(addr)
+                if tags:
+                    seen_tagged[addr] = tags
+    wallet_tags_summary = "\n".join(
+        f"{addr[:10]}...: {', '.join(tags)}"
+        for addr, tags in seen_tagged.items()
+    ) if seen_tagged else "No tagged wallets"
 
+    # Предварительный alpha_score (до AI-ответа, signal_dir="watch" по умолчанию)
+    # Передаём в AI-промпт как контекст; финальный score пересчитывается ниже
+    prelim_score, _ = compute_alpha_score(
+        batch=batch, ai_signal="", price=price, change_24h=change_24h,
+    )
+
+    ai_signal = await analyze_batch(
+        summary_lines       = ai_summary,
+        batch               = batch,
+        window_minutes      = window_min,
+        mnt_price           = price or 0.0,
+        price_change_24h    = change_24h or 0.0,
+        alpha_score         = prelim_score,
+        wallet_tags_summary = wallet_tags_summary,
+    )
+
+    # Финальный alpha_score — пересчитываем с учётом реального AI-сигнала
     alpha_score, signal_dir = compute_alpha_score(
         batch=batch, ai_signal=ai_signal, price=price, change_24h=change_24h,
     )
@@ -847,6 +1007,10 @@ async def aggregate_and_send() -> None:
             "change_24h":  change_24h,
         })
 
+    # Синхронизируем alpha_score с мета-таблицей для веб-дашборда
+    await asyncio.to_thread(save_meta, "alpha_score", str(alpha_score))
+    await asyncio.to_thread(save_meta, "alpha_signal", signal_dir)
+
     type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤"}
     type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи"}
 
@@ -857,6 +1021,16 @@ async def aggregate_and_send() -> None:
         f"⏱ Окно: <b>{window_min} мин</b>  |  Транзакций: <b>{len(batch)}</b>",
         "",
     ]
+
+    # AI-блок: ПОСЛЕ Alpha Score, ДО списка транзакций
+    # Показываем только если AI вернул непустой ответ
+    if ai_signal:
+        lines += [
+            "─────────────────",
+            ai_signal,
+            "─────────────────",
+            "",
+        ]
 
     for addr, data in sorted(grouped.items(), key=lambda x: x[1]["total_mnt"], reverse=True):
         short     = addr[:10] + "..."
@@ -879,20 +1053,32 @@ async def aggregate_and_send() -> None:
                 lines.append(f"     {extra}")
         lines.append("")
 
-    if ai_signal:
-        lines.append(f"🤖 <b>AI-сигнал:</b> {ai_signal}")
-
     message = "\n".join(lines)
 
-    # ИСПРАВЛЕНИЕ 2 — безопасная обрезка HTML-сообщений по границе строки
+    # FIX-H: безопасная обрезка — закрываем незакрытые HTML-теги
     if len(message) > 4000:
-        cut = message[:3980]
+        cut = message[:3900]
         safe_cut = cut.rsplit("\n", 1)[0]
-        message = safe_cut + "\n\n<i>...обрезано</i>"
+        # Закрываем незакрытые теги чтобы Telegram не выдал ошибку парсинга
+        for tag in ("</b>", "</code>", "</i>", "</a>"):
+            open_tag = tag.replace("/", "")
+            if safe_cut.count(open_tag) > safe_cut.count(tag):
+                safe_cut += tag
+        message = safe_cut + "\n\n<i>...сообщение обрезано</i>"
 
     # Исправление 5 — await send_telegram
     await send_telegram(message)
     print(f"[AGG] Отчёт отправлен. Score={alpha_score} Кошельков: {len(grouped)}")
+    # Сохраняем предсказание ПОСЛЕ отправки — не блокируем критический путь  # FIX-1
+    if signal_dir in ("buy", "sell"):
+        try:
+            await asyncio.to_thread(
+                save_prediction,
+                signal_dir, price, alpha_score,
+                sum(e["value_mnt"] for e in batch),
+            )
+        except Exception as e:
+            print(f"[WARN] save_prediction не сохранено: {e}")
 
 # =============================================================================
 # ТАЙМЕР АГРЕГАЦИИ
@@ -908,12 +1094,63 @@ async def aggregation_timer() -> None:
             print(f"[ERROR] aggregate_and_send: {e}")
 
 # =============================================================================
+# ВЕРИФИКАЦИЯ ПРЕДСКАЗАНИЙ — проверяем точность через 1/4/24 часа
+# =============================================================================
+
+async def resolve_predictions() -> None:
+    """Проверяем предсказания через 1/4/24 часа после создания."""
+    while True:
+        await asyncio.sleep(1800)  # каждые 30 минут
+        try:
+            price_now, _ = await asyncio.to_thread(get_mnt_price)
+            if not price_now or price_now <= 0:  # FIX-2
+                continue
+            now = datetime.now(timezone.utc)
+            await asyncio.to_thread(_resolve_predictions_sync, price_now, now)
+        except Exception as e:
+            print(f"[PRED] Ошибка resolve: {e}")
+
+def _resolve_predictions_sync(price_now: float, now: datetime) -> None:
+    """Синхронная часть — обновляет resolved_*/price_* в БД."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, signal, price_at, "
+            "resolved_1h, resolved_4h, resolved_24h "
+            "FROM predictions WHERE resolved_24h IS NULL"  # FIX-4
+        ).fetchall()
+        for row in rows:
+            pred_id, created_at_str, signal, price_at, *_ = row  # FIX-4: распаковка 7-колоночного row
+            if price_at is None:
+                continue
+            created   = datetime.fromisoformat(created_at_str)
+            elapsed_h = (now - created).total_seconds() / 3600
+            change_pct = (price_now - price_at) / price_at * 100
+            correct = (signal == "buy" and change_pct > 0) or (signal == "sell" and change_pct < 0)
+            updates = {}
+            if elapsed_h >= 1  and row[4] is None:  # FIX-4: resolved_1h из row, без N+1 SELECT
+                updates["resolved_1h"] = 1 if correct else 0
+                updates["price_1h"]    = price_now
+            if elapsed_h >= 4  and row[5] is None:  # FIX-4: resolved_4h из row, без N+1 SELECT
+                updates["resolved_4h"] = 1 if correct else 0
+                updates["price_4h"]    = price_now
+            if elapsed_h >= 24 and row[6] is None:  # FIX-4: resolved_24h из row, без N+1 SELECT
+                updates["resolved_24h"] = 1 if correct else 0
+                updates["price_24h"]    = price_now
+            if updates:
+                set_clause = ", ".join(f"{k}=?" for k in updates)
+                conn.execute(
+                    f"UPDATE predictions SET {set_clause} WHERE id=?",
+                    (*updates.values(), pred_id)
+                )
+        conn.commit()
+
+# =============================================================================
 # ОБРАБОТКА НАТИВНЫХ ПЕРЕВОДОВ MNT
 # =============================================================================
 
 async def process_transaction(tx) -> None:
     value_mnt = w3.from_wei(tx["value"], "ether")
-    if value_mnt <= THRESHOLD_MNT:
+    if value_mnt < THRESHOLD_MNT:  # FIX-D: транзакции ровно на пороге теперь проходят
         return
     tx_hash   = tx["hash"].hex()
     from_addr = tx["from"]
@@ -937,7 +1174,6 @@ async def process_transaction(tx) -> None:
         from_addr=from_addr, to_addr=to_addr,
         event_type=event_type, extra_lines=extra_lines,
     )
-
 # =============================================================================
 # ИСПРАВЛЕНИЕ 3 — Semaphore-обёртка для process_transaction
 # =============================================================================
@@ -966,7 +1202,33 @@ async def get_mnt_is_token0(pool_address: str) -> bool:
     return mnt_is_token0
 
 # =============================================================================
-# ОБРАБОТКА СОБЫТИЙ SWAP
+# AGNI FINANCE — получение адреса пула MNT/USDT через factory.getPool()
+# Пробуем тиры 500, 3000, 10000 — берём первый непустой.
+# =============================================================================
+
+async def get_agni_pool_address() -> str:
+    """Определяет адрес пула MNT/USDT на Agni Finance через вызов factory.getPool().
+    Перебирает fee-тиры 500, 3000, 10000 и возвращает первый найденный пул."""
+    factory = w3.eth.contract(
+        address=Web3.to_checksum_address("0x25780dc8Fc3cfBD75F33bFDAB65e969b603b2035"),
+        abi=AGNI_FACTORY_ABI,
+    )
+    wmnt = Web3.to_checksum_address(MNT_TOKEN_ADDRESS)  # FIX-C: единая константа вместо AGNI_WMNT_ADDRESS
+    usdt = Web3.to_checksum_address(AGNI_USDT_ADDRESS)
+    zero = "0x0000000000000000000000000000000000000000"
+
+    for fee in [500, 3000, 10000]:
+        pool = await asyncio.to_thread(
+            factory.functions.getPool(wmnt, usdt, fee).call
+        )
+        if pool != zero:
+            print(f"[AGNI] Найден пул MNT/USDT fee={fee}: {pool}")
+            return pool
+
+    raise RuntimeError("[AGNI] MNT/USDT пул не найден ни на одном fee-тире")
+
+# =============================================================================
+# ОБРАБОТКА СОБЫТИЙ SWAP (Merchant Moe — Uniswap V2)
 # ИСПРАВЛЕНИЕ 2 — decode_swap_log теперь async, определяет позицию MNT динамически.
 # ИСПРАВЛЕНИЕ 1 — добавлены поля mnt_is_out и direction для корректного
 #                 определения Buy/Sell независимо от позиции MNT в пуле.
@@ -1023,29 +1285,140 @@ async def decode_swap_log(log) -> dict | None:
             "mnt_is_token0": mnt_is_token0,
             "mnt_is_out":    mnt_is_out,
             "direction":     "Buy MNT" if mnt_is_out else "Sell MNT",
+            "dex":           "Merchant Moe",
         }
     except Exception as e:
-        print(f"[WARN] Ошибка декодирования Swap лога: {e}")
+        print(f"[WARN] Ошибка декодирования Swap лога (V2): {e}")
         return None
 
-async def process_swap_logs(from_block: int, to_block: int) -> None:
+# =============================================================================
+# ОБРАБОТКА СОБЫТИЙ SWAP (Agni Finance — Uniswap V3)
+#
+# V3 Swap event data layout (5 параметров по 32 байта каждый):
+#   int256  amount0      [0:32]   — знаковый: < 0 = вышло из пула, > 0 = вошло
+#   int256  amount1      [32:64]
+#   uint160 sqrtPriceX96 [64:96]
+#   uint128 liquidity    [96:128]
+#   int24   tick         [128:160]
+#
+# Логика направления:
+#   mnt_delta < 0  →  MNT вышел из пула  →  пользователь купил MNT  (Buy)
+#   mnt_delta > 0  →  MNT вошёл в пул    →  пользователь продал MNT (Sell)
+# =============================================================================
+
+async def decode_agni_swap_log(log: dict) -> dict | None:
+    """Декодирует Swap-лог Agni Finance (Uniswap V3).
+    Возвращает словарь, совместимый с полями decode_swap_log, или None при ошибке."""
     try:
-        # ИСПРАВЛЕНИЕ 1 — используем rpc_get_logs вместо прямого w3.eth.get_logs
+        raw = log["data"]
+        if isinstance(raw, bytes):
+            data = raw
+        else:
+            hex_str = raw[2:] if raw.startswith(("0x", "0X")) else raw
+            data = bytes.fromhex(hex_str)
+
+        if len(data) < 64:
+            return None
+
+        # int256: знаковые 32-байтовые целые (two's complement big-endian)
+        def to_int256(b: bytes) -> int:
+            val = int.from_bytes(b, "big")
+            if val >= 2 ** 255:
+                val -= 2 ** 256
+            return val
+
+        amount0 = to_int256(data[0:32])
+        amount1 = to_int256(data[32:64])
+
+        # amount < 0 = вышло из пула (пользователь получил)
+        # amount > 0 = вошло в пул (пользователь отдал)
+        mnt_is_token0 = await get_mnt_is_token0(log["address"])
+
+        if mnt_is_token0:
+            mnt_delta = amount0
+        else:
+            mnt_delta = amount1
+
+        mnt_val    = float(w3.from_wei(abs(mnt_delta), "ether"))
+        mnt_is_out = mnt_delta < 0  # MNT вышел из пула = пользователь купил MNT
+
+        # sender и recipient — indexed параметры V3, лежат в topics[1] и topics[2]
+        sender = "0x" + log["topics"][1].hex()[-40:]
+        to     = "0x" + log["topics"][2].hex()[-40:]
+
+        return {
+            "sender":        Web3.to_checksum_address(sender),
+            "to":            Web3.to_checksum_address(to),
+            "amount0":       amount0,
+            "amount1":       amount1,
+            "mnt_val":       mnt_val,
+            "other_raw":     abs(amount1 if mnt_is_token0 else amount0),
+            "tx_hash":       log["transactionHash"].hex(),
+            "mnt_is_token0": mnt_is_token0,
+            "mnt_is_out":    mnt_is_out,
+            "direction":     "Buy MNT" if mnt_is_out else "Sell MNT",
+            "dex":           "Agni Finance",
+        }
+    except Exception as e:
+        print(f"[AGNI] Ошибка decode_agni_swap_log: {e}")
+        return None
+
+# =============================================================================
+# ОБРАБОТКА СОБЫТИЙ SWAP — оба DEX в одном вызове get_logs
+#
+# Используется OR-фильтр по topics[0]: [[SWAP_TOPIC_V2, AGNI_SWAP_TOPIC_V3]]
+# Маршрутизация на нужный декодер выполняется по адресу пула в log["address"].
+# ИСПРАВЛЕНИЕ 1 — используем rpc_get_logs вместо прямого w3.eth.get_logs
+# ИСПРАВЛЕНИЕ 2 — decode_swap_log/decode_agni_swap_log async, используем await
+# =============================================================================
+
+async def process_swap_logs(from_block: int, to_block: int) -> None:
+    global AGNI_POOL_ADDRESS
+
+    # Автоматический retry адреса пула Agni Finance если при старте RPC был недоступен
+    if not AGNI_POOL_ADDRESS:
+        try:
+            AGNI_POOL_ADDRESS = await get_agni_pool_address()
+            TAGGED_WALLETS_LOWER[AGNI_POOL_ADDRESS.lower()] = ["Agni Finance Pool", "DEX"]
+            print(f"[AGNI] Пул восстановлен: {AGNI_POOL_ADDRESS}")
+        except Exception as e:
+            print(f"[AGNI] Retry не удался: {e}. Следующая попытка через {POLL_INTERVAL}с.")
+
+    try:
+        # Формируем список активных пулов (Agni добавляется только если адрес получен)
+        dex_pools = [MERCHANT_MOE_POOL]
+        if AGNI_POOL_ADDRESS:
+            dex_pools.append(AGNI_POOL_ADDRESS)
+
+        # OR-условие по topic[0]: вернёт логи любого из двух DEX за один RPC-вызов
         filter_params = {
             "fromBlock": from_block,
             "toBlock":   to_block,
-            "address":   MERCHANT_MOE_POOL,
-            "topics":    [SWAP_TOPIC],
+            "address":   dex_pools,
+            "topics":    [[SWAP_TOPIC, AGNI_SWAP_TOPIC]],
         }
         logs = await rpc_get_logs(filter_params)
         if logs:
             print(f"[DEX] {len(logs)} Swap событий в блоках {from_block}-{to_block}")
+
         tasks = []
         for log in logs:
-            # Исправление 2 — decode_swap_log теперь async, используем await
-            decoded = await decode_swap_log(log)
+            pool_addr = log["address"].lower()
+
+            # Определяем DEX по адресу пула и вызываем соответствующий декодер
+            if pool_addr == MERCHANT_MOE_POOL.lower():
+                decoded = await decode_swap_log(log)
+            elif AGNI_POOL_ADDRESS and pool_addr == AGNI_POOL_ADDRESS.lower():
+                decoded = await decode_agni_swap_log(log)
+            else:
+                # Неизвестный пул — пропускаем
+                continue
+
             if decoded is None or decoded["mnt_val"] <= THRESHOLD_MNT:
                 continue
+
+            dex_name = decoded["dex"]
+
             tasks.append(fire_alert(
                 tx_hash     = decoded["tx_hash"],
                 value_mnt   = decoded["mnt_val"],
@@ -1054,16 +1427,17 @@ async def process_swap_logs(from_block: int, to_block: int) -> None:
                 event_type  = "swap",
                 extra_lines = [
                     # ИСПРАВЛЕНИЕ 1 — используем decoded["direction"] вместо хардкоженной проверки
-                    f"🔁 <b>Тип:</b> {decoded['direction']}",
+                    # v9 — добавляем название DEX: [SWAP · Agni Finance] Buy MNT
+                    f"🔄 <b>Тип:</b> [SWAP · {dex_name}] {decoded['direction']}",
                     f"📊 <b>Другой токен:</b> {decoded['other_raw']} wei",
                 ],
                 extra_log = {
-                    "amount0_in":  decoded["amount0_in"],
-                    "amount1_in":  decoded["amount1_in"],
-                    "amount0_out": decoded["amount0_out"],
-                    "amount1_out": decoded["amount1_out"],
+                    "dex":     dex_name,
+                    "amount0": decoded.get("amount0", decoded.get("amount0_in")),
+                    "amount1": decoded.get("amount1", decoded.get("amount1_in")),
                 },
             ))
+
         if tasks:
             await asyncio.gather(*tasks)
     except Exception as e:
@@ -1078,9 +1452,22 @@ async def process_swap_logs(from_block: int, to_block: int) -> None:
 # ИСПРАВЛЕНИЕ 5 — Лимит catchup-блоков при старте (MAX_CATCHUP_BLOCKS = 500).
 # ИСПРАВЛЕНИЕ 3 — asyncio.gather использует process_transaction_limited.
 # ИСПРАВЛЕНИЕ 2 — last_dex_block персистируется в SQLite meta-таблице.
+# v9 — при старте вызывается get_agni_pool_address() для получения адреса
+#      пула Agni Finance и регистрации его в TAGGED_WALLETS_LOWER.
 # =============================================================================
 
 async def monitor_blocks() -> None:
+    global AGNI_POOL_ADDRESS
+
+    # v9 — получаем адрес пула Agni Finance до начала мониторинга
+    try:
+        AGNI_POOL_ADDRESS = await get_agni_pool_address()
+        # Регистрируем пул в словаре тегов, чтобы он отображался в алертах
+        TAGGED_WALLETS_LOWER[AGNI_POOL_ADDRESS.lower()] = ["Agni Finance Pool", "DEX"]
+        print(f"[AGNI] Пул зарегистрирован: {AGNI_POOL_ADDRESS}")
+    except Exception as e:
+        print(f"[WARN] Не удалось получить адрес пула Agni Finance: {e}. Мониторинг V3 отключён.")
+
     # ИСПРАВЛЕНИЕ 5 — загрузка last_block с ограничением на количество catchup-блоков
     # ИСПРАВЛЕНИЕ 2 — загрузка last_dex_block из meta; стартует от last_block если нет чекпойнта
     saved_block     = await load_meta("last_block")
@@ -1138,47 +1525,22 @@ async def monitor_blocks() -> None:
 async def cmd_start(message: Message) -> None:
     if not await is_authorized(message):
         return
-
-    # Кнопка Mini App (определяем здесь, не снаружи)
-    start_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="📊 Открыть дашборд",
-            web_app=WebAppInfo(url=WEBAPP_URL),
-        )
-    ]])
-
     text = (
         "👋 <b>WhaleWatcher — Mantle Network Monitor</b>\n\n"
         "Бот отслеживает крупные переводы MNT, свопы на Merchant Moe "
         "и движения по кошелькам CEX/Smart Money в реальном времени.\n\n"
         "<b>Доступные команды:</b>\n\n"
         "/start — это сообщение\n"
-        "/webapp — открыть Mini App дашборд\n"
-        "/stats — статистика алертов за 24 часа\n"
-        "/top_whales — топ-10 крупнейших переводов\n"
+        "/stats — статистика алертов за последние 24 часа\n"
+        "/top_whales — топ-10 крупнейших переводов за всё время\n"
         "/alpha — последний Alpha Score\n"
-        "/set_threshold N — изменить порог (пример: <code>/set_threshold 10</code>)\n\n"
+        "/accuracy — точность AI-сигналов (верификация)\n"
+        "/set_threshold N — изменить порог алертов (MNT)\n"
+        "          Пример: <code>/set_threshold 100</code>\n\n"
         f"Текущий порог: <b>{THRESHOLD_MNT} MNT</b>"
     )
-    await message.answer(text, reply_markup=start_keyboard)
+    await message.answer(text)
 
-@dp.message(Command("webapp"))
-async def cmd_webapp(message: Message) -> None:
-    if not await is_authorized(message):
-        return
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="📊 WhaleWatcher Analytics",
-            web_app=WebAppInfo(url=WEBAPP_URL),
-        )
-    ]])
-
-    await message.answer(
-        "📊 <b>WhaleWatcher Mini App</b>\n\n"
-        "Нажми кнопку ниже, чтобы открыть дашборд:",
-        reply_markup=keyboard,
-    )
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
@@ -1368,6 +1730,54 @@ async def cmd_set_threshold(message: Message) -> None:
     )
     print(f"[CFG] Порог изменён: {old_threshold} -> {new_threshold} MNT")
 
+@dp.message(Command("accuracy"))
+async def cmd_accuracy(message: Message) -> None:
+    """Показывает статистику точности AI-сигналов BUY/SELL."""
+    if not await is_authorized(message):
+        return
+    stats = await asyncio.to_thread(_get_accuracy_stats)
+    await message.answer(stats, parse_mode="HTML")
+
+def _get_accuracy_stats() -> str:
+    """Синхронно считывает статистику точности из таблицы predictions."""
+    with get_db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM predictions WHERE signal != 'watch'"
+        ).fetchone()[0]
+        if total == 0:
+            return (
+                "📊 <b>Точность AI-сигналов</b>\n\n"
+                "Предсказаний пока нет. Данные появятся после первых BUY/SELL сигналов."
+            )
+
+        _ALLOWED_PRED_COLS = frozenset({"resolved_1h", "resolved_4h", "resolved_24h"})  # FIX-5
+
+        def pct(col: str) -> str:
+            if col not in _ALLOWED_PRED_COLS:  # FIX-5: блокируем SQL-injection через имя колонки
+                return "—"
+            row = conn.execute(
+                f"SELECT COUNT(*) as n, SUM({col}) as correct "
+                f"FROM predictions WHERE {col} IS NOT NULL"
+            ).fetchone()
+            n, correct = row
+            if n == 0:
+                return "—"
+            correct = correct or 0  # FIX-F: SUM() возвращает None если нет подходящих строк
+            return f"{int(correct / n * 100)}% ({int(correct)}/{n})"
+
+        lines = [
+            "📊 <b>Точность AI-сигналов WhaleWatcher</b>",
+            "",
+            f"Всего предсказаний (BUY/SELL): <b>{total}</b>",
+            "",
+            f"✅ Через  1ч: <b>{pct('resolved_1h')}</b>",
+            f"✅ Через  4ч: <b>{pct('resolved_4h')}</b>",
+            f"✅ Через 24ч: <b>{pct('resolved_24h')}</b>",
+            "",
+            "<i>Верным считается сигнал если цена двинулась в предсказанном направлении.</i>",
+        ]
+        return "\n".join(lines)
+
 # =============================================================================
 # ТОЧКА ВХОДА
 # =============================================================================
@@ -1376,7 +1786,9 @@ if __name__ == "__main__":
     async def main() -> None:
         init_db()   # создаём таблицы при первом запуске (idempotent)
         print("[BOT] Запуск polling и мониторинга блоков...")
+        # FIX-G: включаем resolve_predictions в gather — исключения не будут молча проглочены
         await asyncio.gather(
+            resolve_predictions(),
             monitor_blocks(),
             aggregation_timer(),
             dp.start_polling(bot, allowed_updates=["message"]),
