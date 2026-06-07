@@ -1,0 +1,32 @@
+# Секреты — никогда не коммитить
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Данные бота (локальные логи/кэш)
+alerts.json
+config.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
