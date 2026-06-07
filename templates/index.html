@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>WhaleWatcher</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  --bg:#0d0e14;--card:#161824;--card2:#1c1f2e;
+  --border:rgba(255,255,255,0.07);
+  --blue:#3b82f6;--blue-d:rgba(59,130,246,0.15);
+  --purple:#8b5cf6;--purple-d:rgba(139,92,246,0.15);
+  --green:#10b981;--green-d:rgba(16,185,129,0.12);
+  --yellow:#f59e0b;--yellow-d:rgba(245,158,11,0.12);
+  --red:#ef4444;--red-d:rgba(239,68,68,0.12);
+  --cyan:#06b6d4;
+  --t1:#f1f5f9;--t2:#94a3b8;--t3:#475569;
+  --r:14px;--r2:10px;--r3:8px;
+  --nav:62px;--hdr:54px;
+}
+html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-family:'Inter',sans-serif;font-size:13px}
+
+/* ── APP ── */
+#app{display:flex;flex-direction:column;height:100vh;height:100dvh;max-width:480px;margin:0 auto}
+
+/* ── HEADER ── */
+.hdr{
+  flex-shrink:0;height:var(--hdr);
+  padding:0 1rem;
+  display:flex;align-items:center;justify-content:space-between;
+  background:rgba(13,14,20,0.95);
+  backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--border);
+  position:relative;z-index:100;
+}
+.hdr::after{
+  content:'';position:absolute;bottom:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--blue),var(--purple),transparent);
+}
+.logo{display:flex;align-items:center;gap:.5rem}
+.logo-ico{
+  width:32px;height:32px;border-radius:9px;
+  background:linear-gradient(135deg,#3b82f6,#8b5cf6);
+  display:flex;align-items:center;justify-content:center;
+  font-size:.9rem;color:#fff;flex-shrink:0;
+}
+.logo-txt{font-size:1rem;font-weight:800;letter-spacing:-.3px}
+.logo-txt span{color:var(--blue)}
+.hdr-r{display:flex;align-items:center;gap:.5rem}
+.live{
+  display:flex;align-items:center;gap:.3rem;
+  background:var(--green-d);color:var(--green);
+  border-radius:100px;padding:.2rem .65rem;
+  font-size:.65rem;font-weight:700;letter-spacing:.3px;
+}
+.live::before{
+  content:'';width:5px;height:5px;border-radius:50%;background:var(--green);
+  animation:pulse 2s ease-in-out infinite;
+}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+.hdr-time{font-size:.65rem;color:var(--t3);font-weight:500}
+
+/* ── MAIN ── */
+#main{flex:1;overflow:hidden;position:relative}
+
+/* ── SCREENS ── */
+.screen{
+  position:absolute;inset:0;
+  overflow-y:auto;overflow-x:hidden;
+  padding:.85rem .9rem calc(var(--nav) + 1rem);
+  opacity:0;transform:translateY(8px);
+  pointer-events:none;
+  transition:opacity .22s ease,transform .22s ease;
+  -webkit-overflow-scrolling:touch;
+}
+.screen.active{opacity:1;transform:translateY(0);pointer-events:all}
+.screen::-webkit-scrollbar{width:2px}
+.screen::-webkit-scrollbar-thumb{background:rgba(255,255,255,.06);border-radius:2px}
+
+/* ── BOTTOM NAV ── */
+.nav{
+  flex-shrink:0;height:var(--nav);
+  background:rgba(13,14,20,.98);
+  backdrop-filter:blur(20px);
+  border-top:1px solid var(--border);
+  display:flex;align-items:center;
+}
+.nb{
+  flex:1;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  gap:.2rem;cursor:pointer;padding:.4rem 0;
+  border:none;background:none;
+  transition:all .18s;position:relative;
+}
+.nb i{font-size:1.1rem;color:var(--t3);transition:all .18s}
+.nb span{font-size:.6rem;font-weight:600;color:var(--t3);letter-spacing:.2px}
+.nb.on i,.nb.on span{color:var(--blue)}
+.nb.on i{filter:drop-shadow(0 0 6px rgba(59,130,246,.6))}
+.nb.on::after{
+  content:'';position:absolute;bottom:4px;
+  width:4px;height:4px;border-radius:50%;background:var(--blue);
+}
+.nb-dot{
+  position:absolute;top:6px;right:calc(50% - 15px);
+  width:7px;height:7px;border-radius:50%;
+  background:var(--red);border:2px solid var(--bg);
+}
+
+/* ── CARDS ── */
+.card{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--r);padding:1rem;
+  margin-bottom:.65rem;
+}
+.card-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:.75rem;
+}
+.card-ttl{
+  font-size:.65rem;font-weight:700;text-transform:uppercase;
+  letter-spacing:1.2px;color:var(--t3);
+  display:flex;align-items:center;gap:.35rem;
+}
+.card-more{font-size:.7rem;color:var(--blue);font-weight:600;cursor:pointer}
+
+/* ── ALPHA BLOCK ── */
+.alpha-wrap{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--r);padding:1rem;
+  margin-bottom:.65rem;position:relative;overflow:hidden;
+}
+.alpha-wrap::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--blue),var(--purple),transparent);
+}
+.alpha-wrap::after{
+  content:'';position:absolute;
+  width:180px;height:180px;border-radius:50%;
+  top:-60px;right:-40px;
+  background:radial-gradient(circle,rgba(59,130,246,.06),transparent 70%);
+  pointer-events:none;
+}
+.alpha-top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:.75rem}
+.alpha-lbl{font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--t3);margin-bottom:.3rem}
+.alpha-num{font-size:2.6rem;font-weight:900;letter-spacing:-2px;line-height:1;color:var(--blue)}
+.alpha-sig{
+  display:inline-flex;align-items:center;gap:.25rem;
+  padding:.2rem .65rem;border-radius:100px;
+  font-size:.68rem;font-weight:700;margin-top:.35rem;
+}
+.alpha-track{height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin-bottom:.7rem}
+.alpha-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--blue),var(--purple));transition:width .9s ease}
+.alpha-comps{display:grid;grid-template-columns:repeat(3,1fr);gap:.45rem}
+.alpha-comp{
+  background:rgba(255,255,255,.04);border-radius:var(--r3);
+  padding:.5rem;text-align:center;
+}
+.alpha-comp-v{font-size:1.1rem;font-weight:800;line-height:1}
+.alpha-comp-l{font-size:.58rem;color:var(--t3);margin-top:2px}
+.alpha-comp-m{font-size:.55rem;color:var(--t3)}
+
+/* ── STAT GRID ── */
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.55rem;margin-bottom:.65rem}
+.stat{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--r);padding:.8rem;
+}
+.stat-i{font-size:.62rem;color:var(--t3);margin-bottom:.25rem}
+.stat-v{font-size:1.25rem;font-weight:800;letter-spacing:-.5px;line-height:1}
+.stat-l{font-size:.6rem;color:var(--t3);margin-top:.2rem;font-weight:500}
+
+/* ── CHART ── */
+.chart-box{height:145px;position:relative}
+
+/* ── TOP WALLETS MINI ── */
+.tw{display:flex;align-items:center;gap:.6rem;padding:.5rem 0;border-bottom:1px solid var(--border)}
+.tw:last-child{border:none;padding-bottom:0}
+.tw:first-child{padding-top:0}
+.tw-n{font-size:.65rem;font-weight:700;color:var(--t3);width:14px;text-align:center;flex-shrink:0}
+.tw-ic{width:30px;height:30px;border-radius:var(--r3);display:flex;align-items:center;justify-content:center;font-size:.85rem;flex-shrink:0}
+.tw-inf{flex:1;min-width:0}
+.tw-nm{font-size:.78rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tw-ad{font-size:.6rem;color:var(--t3);font-family:monospace;cursor:pointer;margin-top:1px}
+.tw-ad:hover{color:var(--blue)}
+.tw-vl{text-align:right}
+.tw-mn{font-size:.82rem;font-weight:800;color:var(--blue)}
+.tw-tx{font-size:.6rem;color:var(--t3);margin-top:1px}
+
+/* ── ALERTS ── */
+.filters{display:flex;gap:.35rem;overflow-x:auto;margin-bottom:.6rem;padding-bottom:2px;scrollbar-width:none}
+.filters::-webkit-scrollbar{display:none}
+.fbtn{
+  flex-shrink:0;padding:.3rem .7rem;border-radius:100px;
+  font-size:.68rem;font-weight:600;
+  border:1px solid var(--border);background:none;color:var(--t3);
+  cursor:pointer;transition:all .18s;font-family:'Inter',sans-serif;white-space:nowrap;
+}
+.fbtn.on{background:var(--blue-d);border-color:var(--blue);color:var(--blue)}
+
+.srow{display:flex;gap:.4rem;margin-bottom:.6rem}
+.inp{
+  flex:1;background:var(--card2);border:1px solid var(--border);
+  border-radius:var(--r3);color:var(--t1);
+  padding:.42rem .7rem;font-family:'Inter',sans-serif;font-size:.78rem;outline:none;
+}
+.inp::placeholder{color:var(--t3)}
+.inp:focus{border-color:var(--blue)}
+.sel{
+  background:var(--card2);border:1px solid var(--border);
+  border-radius:var(--r3);color:var(--t1);
+  padding:.42rem .5rem;font-family:'Inter',sans-serif;font-size:.75rem;outline:none;
+}
+
+/* ── ALERT CARD ── */
+.ac{
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--r);padding:.85rem;
+  margin-bottom:.5rem;cursor:pointer;
+  transition:border-color .18s,background .15s;
+  position:relative;overflow:hidden;
+}
+.ac:hover{border-color:rgba(255,255,255,.13);background:var(--card2)}
+.ac-stripe{position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
+.ac-r1{display:flex;align-items:center;justify-content:space-between;margin-bottom:.35rem;padding-left:9px}
+.ac-amt{font-size:1.1rem;font-weight:800;letter-spacing:-.4px}
+.ac-t{font-size:.62rem;color:var(--t3)}
+.ac-r2{display:flex;align-items:center;gap:.3rem;flex-wrap:wrap;margin-bottom:.38rem;padding-left:9px}
+.ac-r3{display:flex;align-items:center;gap:.4rem;padding-left:9px}
+.ac-addrs{display:flex;align-items:center;gap:.3rem;flex:1;min-width:0}
+.ac-a{display:flex;flex-direction:column;gap:1px;flex:1;min-width:0}
+.ac-lbl{font-size:.6rem;font-weight:700;color:var(--purple)}
+.ac-mono{font-family:'Courier New',monospace;font-size:.65rem;color:var(--t2);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ac-mono:hover{color:var(--blue)}
+.ac-arr{color:var(--t3);font-size:.65rem;flex-shrink:0}
+.exp{
+  display:inline-flex;align-items:center;gap:.2rem;
+  background:var(--blue-d);color:var(--blue);
+  border-radius:6px;padding:.18rem .5rem;
+  font-size:.62rem;font-weight:600;text-decoration:none;white-space:nowrap;
+  flex-shrink:0;
+}
+
+/* ── BADGES ── */
+.b{display:inline-flex;align-items:center;gap:.15rem;padding:.1rem .45rem;border-radius:100px;font-size:.62rem;font-weight:700;white-space:nowrap}
+.bt{background:rgba(59,130,246,.14);color:#60a5fa}
+.bs{background:rgba(6,182,212,.14);color:#22d3ee}
+.bi{background:rgba(16,185,129,.14);color:#34d399}
+.bo{background:rgba(239,68,68,.14);color:#f87171}
+.bbuy{background:rgba(16,185,129,.14);color:var(--green)}
+.bsel{background:rgba(239,68,68,.14);color:var(--red)}
+.bwat{background:rgba(245,158,11,.14);color:var(--yellow)}
+.bpen{background:rgba(71,85,105,.18);color:var(--t3)}
+.btag{background:rgba(139,92,246,.12);color:#c4b5fd;font-size:.58rem}
+.bsm{background:rgba(59,130,246,.12);color:#93c5fd}
+.bcex{background:rgba(245,158,11,.12);color:#fcd34d}
+
+/* ── WALLETS SCREEN ── */
+.wlist .tw{padding:.6rem 0}
+
+/* ── INFO SCREEN ── */
+.irow{display:flex;align-items:center;justify-content:space-between;padding:.6rem 0;border-bottom:1px solid var(--border)}
+.irow:last-child{border:none}
+.ik{font-size:.75rem;color:var(--t2);font-weight:500}
+.iv{font-size:.78rem;font-weight:700}
+.thresh{
+  display:inline-flex;align-items:center;gap:.3rem;
+  background:var(--yellow-d);color:var(--yellow);
+  border-radius:100px;padding:.2rem .65rem;
+  font-size:.68rem;font-weight:700;
+}
+
+/* ── LOADER / EMPTY ── */
+.ld{display:flex;align-items:center;justify-content:center;gap:.5rem;padding:2.5rem;color:var(--t3);font-size:.8rem}
+.em{text-align:center;padding:3rem 1rem;color:var(--t3);font-size:.8rem}
+
+/* ── COLOURS ── */
+.cbl{color:var(--blue)}
+.cgr{color:var(--green)}
+.cye{color:var(--yellow)}
+.crd{color:var(--red)}
+.cmu{color:var(--t3)}
+
+/* ── SEC HDR ── */
+.shdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.65rem}
+.sttl{font-size:.85rem;font-weight:700}
+</style>
+</head>
+<body>
+<div id="app">
+
+<!-- HEADER -->
+<header class="hdr">
+  <div class="logo">
+    <div class="logo-ico"><i class="fa-solid fa-fish-fins"></i></div>
+    <div class="logo-txt">Whale<span>Watcher</span></div>
+  </div>
+  <div class="hdr-r">
+    <div class="live">LIVE</div>
+    <div class="hdr-time" id="hdr-t">—</div>
+  </div>
+</header>
+
+<!-- MAIN -->
+<div id="main">
+
+  <!-- DASHBOARD -->
+  <div class="screen active" id="s1">
+
+    <!-- Alpha Score -->
+    <div class="alpha-wrap">
+      <div class="alpha-top">
+        <div>
+          <div class="alpha-lbl"><i class="fa-solid fa-chart-mixed"></i>&nbsp; Alpha Score</div>
+          <div class="alpha-num cbl" id="a-n">—</div>
+          <div class="alpha-sig" id="a-sig">— —</div>
+        </div>
+        <div id="a-ring"></div>
+      </div>
+      <div class="alpha-track"><div class="alpha-fill" id="a-bar" style="width:0%"></div></div>
+      <div class="alpha-comps">
+        <div class="alpha-comp"><div class="alpha-comp-v cbl" id="a-r">—</div><div class="alpha-comp-l">Reputation</div><div class="alpha-comp-m">/ 40</div></div>
+        <div class="alpha-comp"><div class="alpha-comp-v" style="color:var(--purple)" id="a-v">—</div><div class="alpha-comp-l">Volume</div><div class="alpha-comp-m">/ 30</div></div>
+        <div class="alpha-comp"><div class="alpha-comp-v cgr" id="a-m">—</div><div class="alpha-comp-l">Market</div><div class="alpha-comp-m">/ 30</div></div>
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats">
+      <div class="stat"><div class="stat-i"><i class="fa-solid fa-database"></i> Всего</div><div class="stat-v cbl" id="d-tot">—</div><div class="stat-l">алертов</div></div>
+      <div class="stat"><div class="stat-i"><i class="fa-solid fa-clock"></i> За 24ч</div><div class="stat-v cgr" id="d-24">—</div><div class="stat-l">алертов</div></div>
+      <div class="stat"><div class="stat-i"><i class="fa-solid fa-coins"></i> Объём 24ч</div><div class="stat-v cye" id="d-vol">—</div><div class="stat-l">MNT</div></div>
+      <div class="stat"><div class="stat-i"><i class="fa-solid fa-bolt"></i> Макс. тх</div><div class="stat-v crd" id="d-max">—</div><div class="stat-l">MNT</div></div>
+    </div>
+
+    <!-- Chart -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-ttl"><i class="fa-solid fa-chart-bar"></i> Объём по часам (24ч)</div>
+        <div style="display:flex;gap:.4rem;flex-shrink:0">
+          <span style="font-size:.58rem;color:#60a5fa">■ tr</span>
+          <span style="font-size:.58rem;color:#22d3ee">■ sw</span>
+          <span style="font-size:.58rem;color:#34d399">■ in</span>
+          <span style="font-size:.58rem;color:#f87171">■ out</span>
+        </div>
+      </div>
+      <div class="chart-box"><canvas id="ch"></canvas></div>
+    </div>
+
+    <!-- Top 5 -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-ttl"><i class="fa-solid fa-trophy"></i> Топ-5 кошельков</div>
+        <div class="card-more" onclick="go('s3')">Все →</div>
+      </div>
+      <div id="d-top"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
+    </div>
+  </div>
+
+  <!-- ALERTS -->
+  <div class="screen" id="s2">
+    <div class="shdr">
+      <div class="sttl">Алерты</div>
+      <div style="display:flex;align-items:center;gap:.5rem">
+        <span class="thresh"><i class="fa-solid fa-filter"></i>&nbsp;≥<span id="al-th">50</span> MNT</span>
+        <span style="font-size:.65rem;color:var(--t3)" id="al-cnt">—</span>
+      </div>
+    </div>
+
+    <div class="filters" id="flt">
+      <button class="fbtn on" data-t="all">Все</button>
+      <button class="fbtn" data-t="transfer"><i class="fa-solid fa-arrow-right-arrow-left"></i> Transfer</button>
+      <button class="fbtn" data-t="swap"><i class="fa-solid fa-rotate"></i> Swap</button>
+      <button class="fbtn" data-t="cex_inflow"><i class="fa-solid fa-building-columns"></i> CEX ↓</button>
+      <button class="fbtn" data-t="cex_outflow"><i class="fa-solid fa-building-columns"></i> CEX ↑</button>
+    </div>
+
+    <div class="srow">
+      <input class="inp" id="srch" type="text" placeholder="🔍 Адрес / tx hash…"/>
+      <input class="inp" id="mnt" type="number" placeholder="≥ MNT" min="0" style="max-width:82px"/>
+      <select class="sel" id="ord"><option value="time">Время ↓</option><option value="value">Сумма ↓</option></select>
+    </div>
+
+    <div id="al-list"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i> Загрузка…</div></div>
+  </div>
+
+  <!-- WALLETS -->
+  <div class="screen" id="s3">
+    <div class="shdr"><div class="sttl">Умные кошельки</div><span class="b bsm">Smart Money</span></div>
+    <div class="card wlist"><div id="w-list"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div></div>
+  </div>
+
+  <!-- INFO -->
+  <div class="screen" id="s4">
+    <div class="card" style="margin-bottom:.65rem">
+      <div class="card-ttl" style="margin-bottom:.75rem"><i class="fa-solid fa-circle-info"></i> О проекте</div>
+      <div class="irow"><span class="ik">Проект</span><span class="iv">WhaleWatcher v2</span></div>
+      <div class="irow"><span class="ik">Сеть</span><span class="iv">Mantle Network L2</span></div>
+      <div class="irow"><span class="ik">DEX</span><span class="iv">Merchant Moe</span></div>
+      <div class="irow"><span class="ik">AI модель</span><span class="iv">Qwen3-30B</span></div>
+    </div>
+    <div class="card" style="margin-bottom:.65rem">
+      <div class="card-ttl" style="margin-bottom:.75rem"><i class="fa-solid fa-database"></i> Статистика</div>
+      <div class="irow"><span class="ik">Всего алертов</span><span class="iv cbl" id="i-tot">—</span></div>
+      <div class="irow"><span class="ik">За 24ч</span><span class="iv cgr" id="i-24">—</span></div>
+      <div class="irow"><span class="ik">Уникальных кошельков</span><span class="iv" id="i-wal">—</span></div>
+      <div class="irow"><span class="ik">Максимальная тх</span><span class="iv crd" id="i-max">—</span></div>
+      <div class="irow"><span class="ik">Порог алертов</span><span class="iv"><span class="thresh">≥<span id="i-th">—</span> MNT</span></span></div>
+      <div class="irow"><span class="ik">Последний алерт</span><span class="iv cmu" id="i-lst">—</span></div>
+    </div>
+    <button class="fbtn on" style="width:100%;padding:.75rem;border-radius:var(--r);font-size:.82rem" onclick="load(true)">
+      <i class="fa-solid fa-rotate-right"></i>&nbsp; Обновить данные
+    </button>
+  </div>
+
+</div><!-- #main -->
+
+<!-- BOTTOM NAV -->
+<nav class="nav">
+  <button class="nb on" data-s="s1" onclick="go('s1',this)"><i class="fa-solid fa-gauge-high"></i><span>Дашборд</span></button>
+  <button class="nb" data-s="s2" onclick="go('s2',this)" style="position:relative">
+    <i class="fa-solid fa-bell"></i><span>Алерты</span>
+    <div class="nb-dot" id="ndot"></div>
+  </button>
+  <button class="nb" data-s="s3" onclick="go('s3',this)"><i class="fa-solid fa-wallet"></i><span>Киты</span></button>
+  <button class="nb" data-s="s4" onclick="go('s4',this)"><i class="fa-solid fa-circle-info"></i><span>Инфо</span></button>
+</nav>
+
+</div><!-- #app -->
+
+<script>
+/* ── Telegram ── */
+const tg = window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();try{tg.setHeaderColor('#0d0e14')}catch(_){};try{tg.setBackgroundColor('#0d0e14')}catch(_){}}
+const hap = t => {try{tg?.HapticFeedback?.impactOccurred(t||'light')}catch(_){}}
+const hapN= t => {try{tg?.HapticFeedback?.notificationOccurred(t||'success')}catch(_){}}
+
+/* ── NAV ── */
+let cur='s1';
+function go(id,btn){
+  if(id===cur&&!btn)return;
+  hap('light');
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.nb').forEach(b=>b.classList.remove('on'));
+  document.getElementById(id).classList.add('active');
+  const nb=btn||document.querySelector(`.nb[data-s="${id}"]`);
+  if(nb)nb.classList.add('on');
+  cur=id;
+  if(tg?.BackButton){id!=='s1'?tg.BackButton.show():tg.BackButton.hide()}
+  if(id==='s2')document.getElementById('ndot').style.display='none';
+}
+if(tg?.BackButton)tg.BackButton.onClick(()=>{hap();go('s1')});
+
+/* ── HELPERS ── */
+const fmnt=v=>{v=parseFloat(v)||0;if(v>=1e6)return(v/1e6).toFixed(2)+'M';if(v>=1e3)return(v/1e3).toFixed(1)+'K';return v.toFixed(2)};
+const sh=a=>(!a||a.length<12)?a||'—':a.slice(0,8)+'…'+a.slice(-4);
+const rt=ts=>{try{const s=Math.floor((Date.now()-new Date(ts))/1000);if(s<60)return s+'с';if(s<3600)return Math.floor(s/60)+'м';if(s<86400)return Math.floor(s/3600)+'ч';return new Date(ts).toLocaleDateString('ru',{day:'2-digit',month:'2-digit'})}catch{return'—'}};
+const fdt=ts=>{try{return new Date(ts).toLocaleString('ru',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}catch{return ts||'—'}};
+const sig=r=>{if(!r)return['pen','⏳','bpen'];const l=r.trim().toLowerCase();if(l.startsWith('buy'))return['buy','📈 Buy','bbuy'];if(l.startsWith('sell'))return['sel','📉 Sell','bsel'];if(l.startsWith('watch'))return['wat','👀 Watch','bwat'];return['wat','👀','bwat']};
+const typ=t=>({transfer:['bt','🔔 Transfer'],swap:['bs','🔄 Swap'],cex_inflow:['bi','🏦📥 CEX In'],cex_outflow:['bo','🏦📤 CEX Out']}[t]||['bt',t]);
+const stc=t=>({transfer:'#3b82f6',swap:'#06b6d4',cex_inflow:'#10b981',cex_outflow:'#ef4444'}[t]||'#3b82f6');
+const cat=c=>({Smart Money:'bsm',CEX:'bcex',DEX:'bs',Protocol:'bpen'}[c]||'btag');
+const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function cp(a){hap('medium');navigator.clipboard?.writeText(a).then(()=>{tg?.showPopup?.({title:'✅ Скопировано',message:sh(a),buttons:[{type:'ok'}]})}).catch(()=>{})}
+
+/* ── RING SVG ── */
+function ring(s,sz=66){
+  const r=(sz-10)/2,cx=sz/2,cy=sz/2,c=2*Math.PI*r,off=c*(1-s/100);
+  const col=s>=75?'#ef4444':s>=50?'#f59e0b':'#10b981';
+  return`<svg width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="5"/>
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="5"
+      stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}"
+      stroke-linecap="round" transform="rotate(-90 ${cx} ${cy})"/>
+    <text x="${cx}" y="${cy+5}" text-anchor="middle" fill="${col}"
+      font-size="13" font-weight="800" font-family="Inter,sans-serif">${s}</text>
+  </svg>`;
+}
+
+/* ── STATE ── */
+let aType='all',aOrd='time',aSrch='',aMin=0,chart=null;
+
+/* ── STATS ── */
+async function loadStats(){
+  try{
+    const d=await(await fetch('/api/stats')).json();
+    const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v};
+    set('d-tot',(d.total||0).toLocaleString());
+    set('d-24',(d.last_24h?.count||0).toLocaleString());
+    set('d-vol',fmnt(d.last_24h?.volume||0));
+    set('d-max',fmnt(d.max_volume||0));
+    set('i-tot',(d.total||0).toLocaleString());
+    set('i-24',(d.last_24h?.count||0).toLocaleString());
+    set('i-wal',d.unique_wallets||'—');
+    set('i-max',fmnt(d.max_volume||0)+' MNT');
+    set('i-th',d.threshold_mnt??50);
+    set('i-lst',d.last_ts?fdt(d.last_ts):'—');
+    set('al-th',d.threshold_mnt??50);
+    if(d.last_ts)set('hdr-t',rt(d.last_ts)+' ago');
+    const sc=d.alpha_score,sg=d.alpha_signal||'watch';
+    if(sc!=null){
+      set('a-n',sc);
+      document.getElementById('a-bar').style.width=sc+'%';
+      document.getElementById('a-ring').innerHTML=ring(sc);
+      set('a-r',Math.round(sc*.40));
+      set('a-v',Math.round(sc*.30));
+      set('a-m',Math.max(0,sc-Math.round(sc*.40)-Math.round(sc*.30)));
+      const cm={buy:['bbuy','📈 buy'],sell:['bsel','📉 sell'],watch:['bwat','👀 watch']};
+      const[cl,lb]=cm[sg]||['bwat','👀 watch'];
+      const chip=document.getElementById('a-sig');
+      chip.className='alpha-sig '+cl;chip.textContent=lb;
+    }
+  }catch(e){console.error(e)}
+}
+
+/* ── CHART ── */
+async function loadChart(){
+  try{
+    const data=await(await fetch('/api/chart/hourly')).json();
+    const mk=(k,c,l)=>({label:l,data:data.map(d=>d[k]||0),backgroundColor:c,borderRadius:3,borderSkipped:false});
+    const ctx=document.getElementById('ch').getContext('2d');
+    if(chart)chart.destroy();
+    chart=new Chart(ctx,{
+      type:'bar',
+      data:{labels:data.map(d=>d.label),datasets:[
+        mk('transfer','rgba(59,130,246,.8)','Transfer'),
+        mk('swap','rgba(6,182,212,.8)','Swap'),
+        mk('cex_inflow','rgba(16,185,129,.8)','CEX In'),
+        mk('cex_outflow','rgba(239,68,68,.8)','CEX Out'),
+      ]},
+      options:{
+        responsive:true,maintainAspectRatio:false,animation:{duration:600},
+        plugins:{legend:{display:false},tooltip:{
+          backgroundColor:'#161824',borderColor:'rgba(255,255,255,.07)',borderWidth:1,
+          titleFont:{family:'Inter',size:10},bodyFont:{family:'Inter',size:11},
+          callbacks:{label:c=>` ${c.dataset.label}: ${fmnt(c.raw)} MNT`}
+        }},
+        scales:{
+          x:{stacked:true,grid:{color:'rgba(255,255,255,.04)',drawTicks:false},border:{display:false},
+             ticks:{color:'#475569',font:{family:'Inter',size:9},maxRotation:0,autoSkip:true,maxTicksLimit:8}},
+          y:{stacked:true,grid:{color:'rgba(255,255,255,.04)',drawTicks:false},border:{display:false},
+             ticks:{color:'#475569',font:{family:'Inter',size:9},callback:v=>fmnt(v)}}
+        }
+      }
+    });
+  }catch(e){console.error(e)}
+}
+
+/* ── TOP WALLETS ── */
+const CAT_BG={
+  'Smart Money':'rgba(59,130,246,.18)','CEX':'rgba(245,158,11,.18)',
+  'DEX':'rgba(6,182,212,.18)','Protocol':'rgba(100,116,139,.18)',
+  'Routing':'rgba(139,92,246,.18)','Potential':'rgba(16,185,129,.18)','Unknown':'rgba(71,85,99,.18)'
+};
+async function loadWallets(){
+  try{
+    const data=await(await fetch('/api/top_wallets')).json();
+    const html=data.map((w,i)=>{
+      const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
+      const em=(w.label.match(/\p{Emoji}/u)||['🔷'])[0];
+      const nm=w.label.replace(/^[\p{Emoji}\s]+/u,'');
+      return`<div class="tw">
+        <div class="tw-n">${i+1}</div>
+        <div class="tw-ic" style="background:${bg}">${em}</div>
+        <div class="tw-inf">
+          <div class="tw-nm">${esc(nm)}</div>
+          <div class="tw-ad" onclick="cp('${esc(w.addr)}')" title="Нажать для копирования">${sh(w.addr)}</div>
+        </div>
+        <div class="tw-vl">
+          <div class="tw-mn">${fmnt(w.vol)}</div>
+          <div class="tw-tx">${w.count} тх &nbsp;<span class="b ${cat(w.cat)}">${esc(w.cat)}</span></div>
+        </div>
+      </div>`;
+    }).join('');
+    document.getElementById('d-top').innerHTML=html;
+    document.getElementById('w-list').innerHTML=html;
+  }catch(e){
+    const err='<div class="em">⚠️ Ошибка загрузки</div>';
+    document.getElementById('d-top').innerHTML=err;
+    document.getElementById('w-list').innerHTML=err;
+  }
+}
+
+/* ── ALERTS ── */
+async function loadAlerts(){
+  document.getElementById('al-list').innerHTML='<div class="ld"><i class="fa-solid fa-spinner fa-spin"></i> Загрузка…</div>';
+  const p=new URLSearchParams({limit:100,type:aType,min_mnt:aMin,search:aSrch,order:aOrd});
+  try{
+    const body=await(await fetch(`/api/alerts?${p}`)).json();
+    const rows=body.data||[];
+    document.getElementById('al-cnt').textContent=rows.length+' записей';
+    if(!rows.length){document.getElementById('al-list').innerHTML='<div class="em">😶 Алертов не найдено</div>';return}
+    document.getElementById('al-list').innerHTML=rows.map(r=>{
+      const[,sl,sc]=sig(r.ai_signal);
+      const[tc,tl]=typ(r.type);
+      const st=stc(r.type);
+      const tags=(r.tags||[]).map(t=>`<span class="b btag">${esc(t.replace(/^FROM:|^TO:/,''))}</span>`).join(' ');
+      const mc=parseFloat(r.value_mnt)>=5000?'crd':parseFloat(r.value_mnt)>=1000?'cye':'cbl';
+      const fromB=`<div class="ac-a">${r.from_label?`<div class="ac-lbl">${esc(r.from_label)}</div>`:''}
+        <div class="ac-mono" onclick="cp('${esc(r.from_addr)}')" title="${esc(r.from_addr)}">${sh(r.from_addr)}</div></div>`;
+      const toB=`<div class="ac-a">${r.to_label?`<div class="ac-lbl">${esc(r.to_label)}</div>`:''}
+        <div class="ac-mono" onclick="cp('${esc(r.to_addr)}')" title="${esc(r.to_addr)}">${sh(r.to_addr)}</div></div>`;
+      return`<div class="ac">
+        <div class="ac-stripe" style="background:${st}"></div>
+        <div class="ac-r1">
+          <div class="ac-amt ${mc}">${fmnt(r.value_mnt)} <span style="font-size:.7rem;font-weight:500;color:var(--t3)">MNT</span></div>
+          <div class="ac-t">${rt(r.timestamp)} назад</div>
+        </div>
+        <div class="ac-r2"><span class="b ${tc}">${tl}</span><span class="b ${sc}">${sl}</span>${tags}</div>
+        <div class="ac-r3">
+          <div class="ac-addrs">${fromB}<div class="ac-arr">→</div>${toB}</div>
+          <a class="exp" href="${esc(r.scan_url)}" onclick="hap();tg?.openLink?.('${esc(r.scan_url)}');return false;">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> Explorer
+          </a>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){document.getElementById('al-list').innerHTML=`<div class="em">⚠️ ${esc(e.message)}</div>`}
+}
+
+/* ── FILTER EVENTS ── */
+document.getElementById('flt').addEventListener('click',e=>{
+  const b=e.target.closest('.fbtn');if(!b)return;
+  hap();
+  document.querySelectorAll('#flt .fbtn').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');aType=b.dataset.t;loadAlerts();
+});
+let db;
+document.getElementById('srch').addEventListener('input',e=>{clearTimeout(db);db=setTimeout(()=>{aSrch=e.target.value.trim();loadAlerts()},400)});
+document.getElementById('mnt').addEventListener('change',e=>{aMin=parseFloat(e.target.value)||0;hap();loadAlerts()});
+document.getElementById('ord').addEventListener('change',e=>{aOrd=e.target.value;hap();loadAlerts()});
+
+/* ── CLOCK ── */
+const clk=()=>document.getElementById('hdr-t').textContent=new Date().toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'});
+setInterval(clk,60000);clk();
+
+/* ── LOAD ALL ── */
+async function load(h){
+  if(h)hapN();
+  await Promise.all([loadStats(),loadChart(),loadWallets(),loadAlerts()]);
+  document.getElementById('ndot').style.display='block';
+}
+setInterval(load,30000);
+load();
+</script>
+</body>
+</html>
