@@ -315,9 +315,11 @@ if MODELSCOPE_API_KEY:
             base_url="https://api-inference.modelscope.ai/v1",
             api_key=MODELSCOPE_API_KEY,
         )
-        print("[INFO] Qwen API клиент инициализирован.")
+        print("[QWEN] Клиент инициализирован. Модель: Qwen/Qwen3-30B-A3B-Instruct-2507")
     except Exception as e:
         print(f"[WARN] Не удалось инициализировать Qwen клиент: {e}")
+else:
+    print("[QWEN] ОШИБКА: MODELSCOPE_API_KEY не задан — AI-анализ отключён")
 
 # =============================================================================
 # TELEGRAM BOT (aiogram 3.x)
