@@ -25,4 +25,4 @@ print("[START] Flask запущен в фоне ✅")
 # runpy запускает main.py как __main__ — срабатывает if __name__ == "__main__"
 # и запускается asyncio.run(main()) с мониторингом блоков
 print("[START] Запускаем бот и мониторинг Mantle...")
-runpy.run_path("main.py", run_name="__main__")
+runpy.run_path("main (2).py", run_name="__main__")
