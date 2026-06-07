@@ -24,7 +24,13 @@ from openai import OpenAI
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    WebAppInfo,
+    CallbackQuery,
+)
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
@@ -108,6 +114,8 @@ _required_env = ["MANTLE_RPC_URL", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
 _missing = [v for v in _required_env if not os.getenv(v)]
 if _missing:
     raise EnvironmentError(f"Не заданы переменные окружения: {', '.join(_missing)}")
+
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")  # URL мини-апп на Railway (опционально)
 
 # =============================================================================
 # FREEMIUM — PRO-пользователи
@@ -1561,6 +1569,47 @@ async def monitor_blocks() -> None:
 # Все обработчики защищены проверкой is_authorized (ИСПРАВЛЕНИЕ 1).
 # =============================================================================
 
+# =============================================================================
+# INLINE-КЛАВИАТУРА ГЛАВНОГО МЕНЮ
+# =============================================================================
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Главное меню бота с inline-кнопками."""
+    rows = [
+        [
+            InlineKeyboardButton(text="📊 Статистика",   callback_data="cmd_stats"),
+            InlineKeyboardButton(text="🐳 Топ китов",    callback_data="cmd_top_whales"),
+        ],
+        [
+            InlineKeyboardButton(text="🎯 Alpha Score",  callback_data="cmd_alpha"),
+            InlineKeyboardButton(text="🔒 Accuracy PRO", callback_data="cmd_accuracy"),
+        ],
+    ]
+    # Кнопка Web App — добавляется только если WEBAPP_URL задан в окружении
+    if WEBAPP_URL:
+        rows.append([
+            InlineKeyboardButton(
+                text="🌐 Открыть Dashboard",
+                web_app=WebAppInfo(url=WEBAPP_URL),
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(lambda c: c.data in ("cmd_stats", "cmd_top_whales", "cmd_alpha", "cmd_accuracy"))
+async def handle_menu_callback(callback: CallbackQuery) -> None:
+    """Обрабатывает нажатия кнопок главного меню — переиспользует существующие хендлеры."""
+    await callback.answer()  # убираем часики на кнопке
+    if callback.data == "cmd_stats":
+        await cmd_stats(callback.message)
+    elif callback.data == "cmd_top_whales":
+        await cmd_top_whales(callback.message)
+    elif callback.data == "cmd_alpha":
+        await cmd_alpha(callback.message)
+    elif callback.data == "cmd_accuracy":
+        await cmd_accuracy(callback.message)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     if not await is_authorized(message):
@@ -1584,6 +1633,7 @@ async def cmd_start(message: Message) -> None:
         "• Верификация AI-сигналов (/accuracy)\n"
         "Подключение: @notuzo\n"
     )
+    # Отправляем приветствие с inline-клавиатурой главного меню
     await message.answer(text, reply_markup=main_menu_keyboard())
 
 
