@@ -1,0 +1,5 @@
+aiogram==3.7.0       # Telegram-бот
+web3==6.20.3         # Mantle RPC
+requests==2.32.3     # HTTP (CoinGecko, Telegram fallback)
+python-dotenv==1.0.1 # .env файл
+openai==1.35.3       # Qwen/ModelScope API
