@@ -724,6 +724,9 @@ def analyze_batch_sync(
     tx_summary    = "\n".join(summary_lines)
 
     try:
+        # stream=True — как в эталонном скрипте ModelScope.
+        # Без стриминга ModelScope может таймаутить или вернуть пустой ответ
+        # на длинных генерациях; стриминг получает токены по мере готовности.
         response = qwen_client.chat.completions.create(
             model="Qwen/Qwen3-30B-A3B-Instruct-2507",
             messages=[
@@ -772,9 +775,17 @@ def analyze_batch_sync(
                     ),
                 },
             ],
-            # ИСПРАВЛЕНИЕ 3 — строка stream=False удалена (дефолтное значение)
+            stream=True,  # совпадает с эталонным скриптом ModelScope
         )
-        return response.choices[0].message.content.strip()
+        # При stream=True ответ — итератор чанков; накапливаем delta.content
+        # (при stream=False был бы response.choices[0].message.content — несовместимо)
+        result_parts: list[str] = []
+        for chunk in response:
+            if chunk.choices:
+                delta_content = chunk.choices[0].delta.content
+                if delta_content:
+                    result_parts.append(delta_content)
+        return "".join(result_parts).strip()
     except Exception as e:
         print(f"[WARN] Ошибка Qwen API (batch): {e}")
         return ""
