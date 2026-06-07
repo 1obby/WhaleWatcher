@@ -11,6 +11,7 @@ import functools
 import json
 import math
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 import threading
@@ -112,10 +113,9 @@ if _missing:
 # FREEMIUM — PRO-пользователи
 # =============================================================================
 
-# PRO-пользователи — список ID через запятую в переменной окружения PRO_USER_IDS
-PRO_USER_IDS: set[int] = {
-    int(x) for x in os.getenv("PRO_USER_IDS", "").split(",") if x.strip().isdigit()
-}
+# PRO-пользователи — задаются вручную (в будущем через платёжную систему)
+# Формат: множество int ID. Добавлять через запятую.
+PRO_USER_IDS: set[int] = set()
 
 def is_pro(message) -> bool:
     """Проверяет является ли пользователь PRO-подписчиком."""
@@ -786,7 +786,12 @@ def analyze_batch_sync(
                 delta_content = chunk.choices[0].delta.content
                 if delta_content:
                     result_parts.append(delta_content)
-        return "".join(result_parts).strip()
+        raw = "".join(result_parts).strip()
+        # Конвертируем markdown **bold** → HTML <b>bold</b> для Telegram
+        clean = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', raw)
+        # Убираем одиночные звёздочки если остались после конвертации
+        clean = clean.replace('*', '')
+        return clean
     except Exception as e:
         print(f"[WARN] Ошибка Qwen API (batch): {e}")
         return ""
