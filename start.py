@@ -19,4 +19,4 @@ print("[START] Flask запущен ✅")
 
 # Бот в главном потоке
 print("[START] Запуск бота...")
-runpy.run_path("main (2).py", run_name="__main__")
+runpy.run_path("main.py", run_name="__main__")
