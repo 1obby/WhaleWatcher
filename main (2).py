@@ -1,0 +1,1388 @@
+# =============================================================================
+# Mantle Network — мониторинг + агрегация + тегирование кошельков
+# v8: +авторизация, +dynamic token0/token1, +semaphore, +price_cache lock,
+#     +catchup cap, +flood control send_telegram
+# Зависимости: pip install web3 requests openai python-dotenv "aiogram>=3.4"
+# =============================================================================
+
+import asyncio
+import functools
+import json
+import math
+import os
+import sqlite3
+import threading
+import time
+import requests
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from web3 import Web3
+from openai import OpenAI
+
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# =============================================================================
+# RETRY-ДЕКОРАТОР
+# =============================================================================
+
+def async_retry(max_attempts: int = 3, base_delay: float = 1.0, exceptions: tuple = (Exception,)):
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == max_attempts - 1:
+                        print(f"[ERROR] {func.__name__} failed after {max_attempts} attempts: {e}")
+                        raise
+                    delay = base_delay * (2 ** attempt)
+                    print(f"[RETRY] {func.__name__} attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
+        return wrapper
+    return decorator
+
+# =============================================================================
+# КОНФИГУРАЦИЯ — config.json
+# =============================================================================
+
+CONFIG_FILE = "config.json"
+
+def load_config() -> dict:
+    """Читает config.json; при отсутствии или ошибке возвращает пустой словарь."""
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] Не удалось прочитать {CONFIG_FILE}: {e}")
+        return {}
+
+def save_config(data: dict) -> None:
+    """Перезаписывает config.json переданными данными."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[CFG] {CONFIG_FILE} обновлён: {data}")
+    except OSError as e:
+        print(f"[ERROR] Не удалось сохранить {CONFIG_FILE}: {e}")
+
+# =============================================================================
+# НАСТРОЙКИ
+# =============================================================================
+
+RPC_URL            = os.getenv("MANTLE_RPC_URL")
+POLL_INTERVAL      = 15
+AGGREGATION_WINDOW = 1 * 60    # 1 минута
+
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+WEBAPP_URL     = os.getenv("WEBAPP_URL", "http://localhost:5000")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY")
+
+MANTLESCAN_URL = "https://mantlescan.xyz/tx/"
+DB_FILE        = "alerts.db"   # SQLite вместо alerts.json
+
+COINGECKO_URL = (
+    "https://api.coingecko.com/api/v3/simple/price"
+    "?ids=mantle&vs_currencies=usd&include_24hr_change=true"
+)
+PRICE_CACHE_TTL = 5 * 60   # 5 минут
+
+_cfg = load_config()
+THRESHOLD_MNT: float = float(
+    os.getenv("THRESHOLD_MNT_ENV") or _cfg.get("threshold_mnt", 50)
+)
+print(f"[CFG] Порог алертов: {THRESHOLD_MNT} MNT")
+
+# =============================================================================
+# DEX: Merchant Moe
+# =============================================================================
+
+MERCHANT_MOE_POOL = Web3.to_checksum_address("0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a")
+SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+
+# Адрес WMNT (Wrapped MNT) — используется для определения позиции токена в пуле
+MNT_TOKEN_ADDRESS = "0x78c1b0C915c4FAA5fFFa6cAbF0219DA63d7f4CB8"
+
+# Минимальный ABI пула для чтения token0/token1
+POOL_ABI = [
+    {"inputs": [], "name": "token0",
+     "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "token1",
+     "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+# =============================================================================
+# TAGGED WALLETS
+# Структура: первый тег — роль/имя, второй — категория для Alpha Score
+# =============================================================================
+
+TAGGED_WALLETS: dict[str, list[str]] = {
+    # Bybit (CEX + relay)
+    "0x0d4Dc3b8BEcc98782309e443A6DA4b9455B5CA48": ["Bybit",          "CEX"],
+    "0x88a1493366d48225FC3cefBdAe9Ebb23e323Ade3": ["Bybit",          "CEX"],
+    "0x588846213a30fd36244e0Ae0eBb2374516DA836C": ["Bybit Hot Relay", "High-frequency"],
+    "0xC868D0EA71243f1580F934cDc59620603Bf9f1f1": ["Bybit Hot Relay", "High-frequency"],
+    "0x4a67e97E770DE93952b8596F04c13ADa0AB9A69C": ["Bybit Relay",     "High-frequency"],
+    # Binance (CEX)
+    "0xB38e8c17e38363aF6EbdCb3dAE12e0243582891D": ["Binance", "CEX"],
+    "0x28C6c06298d514Db089934071355E5743bf21d60": ["Binance", "CEX"],
+    # KuCoin (CEX)
+    "0x2933782B5a8d72f2754103d1489614F29bfA4625": ["KuCoin", "CEX"],
+    # Mantle официальные контракты / казна
+    "0xb9d507990c009Ed1ee853A07B6a20C0925DD8A08": ["Mantle: Budget L2",   "Protocol"],
+    "0x78c1b0C915c4FAA5fFFa6cAbF0219DA63d7f4CB8": ["Mantle: WMNT Token",  "Protocol"],
+    "0xeD884F0460A634c69DbB7DEf54858465808AACEf": ["Mantle: Rewards Stn", "Protocol"],
+    "0xcD9Dab9Fa5b55eE4569EDc402D3206123B1285F4": ["Mantle: Treasury FF", "Protocol"],
+    "0x94FEC56BbEcEAcc71C9e61623ACE9f8E1B1cf473": ["Mantle: Treasury L2", "Protocol"],
+    # Merchant Moe DEX
+    "0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a": ["Merchant Moe Pool", "DEX"],
+    # MNT киты (Top Accounts MantleScan)
+    "0xF22943D05AB93f63b0A229b12f4425E72A4c1f1C": ["MNT Whale Top-1",    "Smart Money"],
+    "0x59800fc68C7039566eD7a04b0f735255093cAC1d": ["MNT Whale Top-2",    "Smart Money"],
+    "0x0f0C716b007C289C0011E470cC7f14De4fe9FC80": ["Strategic Holder",   "Smart Money"],
+    "0x15Bb5D31048381C84a157526cef9513531B8BE1e": ["Institutional Fund",  "Smart Money"],
+    "0xA19AB9905dC9e4bCb8F982B063710A508B612434": ["Strategic Holder #2", "Smart Money"],
+    "0xA713fc94dB054aA435af4D9c66c3433dCA98559F": ["Strategic Holder #3", "Smart Money"],
+    "0x6117A8AF9d748780051415433a5702ee5F669D2D": ["MNT Whale #3",        "Smart Money"],
+    "0xeaF4311EE279734FAcf77D167EeC277D8343603e": ["Smart Holder #1",     "Smart Money"],
+    "0x4EdB32CFc71E6C404bEa8BBBdc8D9b8E03B08235": ["Smart Holder #2",     "Smart Money"],
+    "0xD4D2E6eBCA6c94dD28a0935ae468012FDda5D35A": ["Smart Holder #3",     "Smart Money"],
+    # Активные DeFi-трейдеры
+    "0x682a1aB616f3Ff8378392FBE6C8d17826081456f": ["Active DeFi Trader", "Smart Money"],
+    "0xd8169F099CE16C87A99d2A8494023574b5eEA9c5": ["High-freq Trader",   "Smart Money"],
+    # Mega Whale / OTC-кластер (поведенческий анализ Jun 2026)
+    "0x0000004ebA872864a71b957180Eb17DFf71BB8f1": ["Mega Whale", "OTC Distributor", "Bybit-funded", "Smart Money"],
+    "0x88A8984F2B8507BBc1c699594E3a4ECdefED4784": ["Whale Cold Storage", "Accumulator", "Smart Money"],
+    "0x7647b72B4c89446f7d86BB7A30fd51b6D91577Aa": ["Personal Relay", "Routing Wallet", "High-frequency"],
+    "0x6906d4ac9236849A755d16b38945Cdc44Dc01d07": ["Routing Wallet", "Relay"],
+    "0xE6aEc6f5b4A21722d2663e0E2bF8cBE4D16c0747": ["Large Sender",      "Potential Whale"],
+    "0x193f3520FbC1948d46a4Cf37F2D1B13AD6c5ea17": ["Large Accumulator", "Potential Whale"],
+    "0x4589ac7bC932B8C8E4ea001d44D40d5e4858B808": ["Unknown Sender"],
+    "0x6d9982a5902227E7d6838f3E5dA421de587e94b3": ["DeFi Contract?", "Protocol"],
+}
+
+TAGGED_WALLETS_LOWER: dict[str, list[str]] = {
+    k.lower(): v for k, v in TAGGED_WALLETS.items()
+}
+
+# =============================================================================
+# ИСПРАВЛЕНИЕ 3 — Единый источник тегов кошельков
+# CEX_ADDRESSES и CEX_ADDRESSES_LOWER (как отдельные константы) удалены.
+# CEX_ADDRESSES_LOWER вычисляется динамически из TAGGED_WALLETS.
+# Все проверки вида `addr in CEX_ADDRESSES_LOWER` остаются без изменений.
+# =============================================================================
+
+CEX_ADDRESSES_LOWER: set[str] = {
+    addr.lower()
+    for addr, tags in TAGGED_WALLETS.items()
+    if any(t in ("CEX", "Binance", "Bybit", "KuCoin", "OKX", "Coinbase") for t in tags)
+}
+
+# =============================================================================
+# ALPHA SCORE — веса категорий кошельков
+# =============================================================================
+
+TAG_CATEGORY_WEIGHTS: dict[str, int] = {
+    "Smart Money":        15,
+    "Active DeFi Trader": 12,
+    "High-freq Trader":   10,
+    "CEX":                 8,
+    "High-frequency":      6,
+    "DEX":                 5,
+    "Protocol":            2,
+    "Mega Whale":         15,
+    "Whale Cold Storage": 12,
+    "Accumulator":        10,
+    "OTC Distributor":     8,
+    "Bybit-funded":        4,
+    "Personal Relay":      6,
+    "Routing Wallet":      4,
+    "Relay":               3,
+    "Potential Whale":     8,
+    "Large Sender":        6,
+    "Large Accumulator":   8,
+    "Unknown Sender":      1,
+}
+
+# ИСПРАВЛЕНИЕ 3 — asyncio.Lock для _last_alpha
+# Защищает от гонки между aggregate_and_send (запись) и cmd_alpha (чтение).
+_last_alpha: dict = {
+    "score":       None,
+    "signal":      None,
+    "computed_at": None,
+    "total_mnt":   None,
+    "price":       None,
+    "change_24h":  None,
+}
+_last_alpha_lock = asyncio.Lock()
+
+# =============================================================================
+# ПОДКЛЮЧЕНИЕ К СЕТИ
+# =============================================================================
+
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
+if not w3.is_connected():
+    raise ConnectionError(f"Не удалось подключиться к RPC: {RPC_URL}")
+print(f"[INFO] Подключено к Mantle. Последний блок: {w3.eth.block_number}")
+
+# =============================================================================
+# ИСПРАВЛЕНИЕ 1 — Retry-обёртки для RPC-вызовов Mantle
+# =============================================================================
+
+@async_retry(max_attempts=4, base_delay=1.0, exceptions=(Exception,))
+async def rpc_get_block_number() -> int:
+    return await asyncio.to_thread(lambda: w3.eth.block_number)
+
+@async_retry(max_attempts=4, base_delay=1.0, exceptions=(Exception,))
+async def rpc_get_block(block_num: int) -> dict:
+    return await asyncio.to_thread(lambda: w3.eth.get_block(block_num, full_transactions=True))
+
+@async_retry(max_attempts=4, base_delay=1.0, exceptions=(Exception,))
+async def rpc_get_logs(filter_params: dict) -> list:
+    return await asyncio.to_thread(lambda: w3.eth.get_logs(filter_params))
+
+# =============================================================================
+# QWEN КЛИЕНТ
+# =============================================================================
+
+qwen_client = None
+if MODELSCOPE_API_KEY:
+    try:
+        qwen_client = OpenAI(
+            base_url="https://api-inference.modelscope.ai/v1",
+            api_key=MODELSCOPE_API_KEY,
+        )
+        print("[INFO] Qwen API клиент инициализирован.")
+    except Exception as e:
+        print(f"[WARN] Не удалось инициализировать Qwen клиент: {e}")
+
+# =============================================================================
+# TELEGRAM BOT (aiogram 3.x)
+# =============================================================================
+
+bot = Bot(
+    token=TELEGRAM_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
+
+# =============================================================================
+# ИСПРАВЛЕНИЕ 1 (авторизация) — вспомогательная функция сразу после инициализации бота
+# =============================================================================
+
+async def is_authorized(message: Message) -> bool:
+    if str(message.chat.id) != str(TELEGRAM_CHAT_ID):
+        await message.answer("⛔ Недостаточно прав.")
+        return False
+    return True
+
+# =============================================================================
+# БУФЕРЫ И БЛОКИРОВКИ
+#
+# _buffer_lock  — защита pending_alerts от concurrent append/clear.
+# _hashes_lock и _file_lock УДАЛЕНЫ: дедупликация и атомарность теперь
+# обеспечиваются на уровне SQLite через UNIQUE constraint + INSERT OR IGNORE.
+#
+# _tx_semaphore — ИСПРАВЛЕНИЕ 3: ограничение параллельных process_transaction.
+# =============================================================================
+
+_buffer_lock  = asyncio.Lock()
+_tx_semaphore = asyncio.Semaphore(20)  # объявлена как глобальная константа
+
+pending_alerts: list[dict] = []
+
+# =============================================================================
+# КЭШИРОВАННАЯ ЦЕНА MNT (CoinGecko)
+# ИСПРАВЛЕНИЕ 4 — double-checked locking: устраняет double-fetch
+# когда два потока одновременно проходят TTL-проверку.
+# =============================================================================
+
+_price_cache: dict = {
+    "price":      0.0,
+    "change_24h": 0.0,
+    "fetched_at": datetime.min.replace(tzinfo=timezone.utc),
+}
+_price_cache_lock = threading.Lock()  # threading.Lock потому что get_mnt_price — sync функция
+
+def get_mnt_price() -> tuple[float, float]:
+    """Возвращает (price_usd, change_24h_pct). Кэш живёт PRICE_CACHE_TTL сек.
+    ИСПРАВЛЕНИЕ 4 — паттерн double-checked locking: fetched_at обновляется
+    внутри лока ДО HTTP-запроса, чтобы второй поток не пошёл за данными
+    одновременно с первым."""
+    now = datetime.now(timezone.utc)
+
+    with _price_cache_lock:
+        age = (now - _price_cache["fetched_at"]).total_seconds()
+        if age < PRICE_CACHE_TTL:
+            return _price_cache["price"], _price_cache["change_24h"]
+        # Помечаем что идём за данными — сбрасываем fetched_at в «сейчас»,
+        # чтобы второй поток увидел age=0 и вернул старые данные без повторного запроса
+        _price_cache["fetched_at"] = now  # временная блокировка
+
+    # HTTP-запрос вне лока — не блокируем других на время HTTP
+    try:
+        resp = requests.get(COINGECKO_URL, timeout=8)
+        data = resp.json()
+        price  = data["mantle"]["usd"]
+        change = data["mantle"]["usd_24h_change"]
+    except Exception:
+        # При ошибке возвращаем старые данные
+        with _price_cache_lock:
+            return _price_cache["price"], _price_cache["change_24h"]
+
+    # Обновляем кэш с реальным временем после успешного запроса
+    with _price_cache_lock:
+        _price_cache.update({
+            "price":      price,
+            "change_24h": change,
+            "fetched_at": datetime.now(timezone.utc),
+        })
+
+    print(f"[PRICE] MNT: ${price:.4f}  |  24h: {change:+.2f}%")
+    return price, change
+
+def format_price_line(price: float | None, change_24h: float | None) -> str:
+    if price is None:
+        return "💰 <b>MNT:</b> N/A"
+    if change_24h is None:
+        return f"💰 <b>MNT:</b> ${price:.4f}"
+    arrow = "📈" if change_24h >= 0 else "📉"
+    sign  = "+" if change_24h >= 0 else ""
+    return f"💰 <b>MNT:</b> ${price:.4f}  ({arrow} {sign}{change_24h:.2f}% 24h)"
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ТЕГИРОВАНИЯ
+# =============================================================================
+
+def get_wallet_tags(address: str) -> list[str]:
+    return TAGGED_WALLETS_LOWER.get(address.lower(), [])
+
+def format_tags(tags: list[str]) -> str:
+    if not tags:
+        return ""
+    return " ".join(f"[{t}]" for t in tags)
+
+# =============================================================================
+# БАЗА ДАННЫХ — инициализация
+# =============================================================================
+
+def init_db() -> None:
+    """
+    Создаёт таблицы alerts и meta (idempotent — безопасно вызывать повторно).
+
+    alerts — лог всех алертов; tx_hash UNIQUE обеспечивает дедупликацию
+             на уровне БД без хранения множества в памяти.
+    meta   — пары ключ/значение для чекпоинтов (last_block и др.).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    # ИСПРАВЛЕНИЕ 1 — WAL-режим устраняет OperationalError: database is locked
+    # при параллельных записях из нескольких asyncio-задач
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    with conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT    NOT NULL,
+                tx_hash   TEXT    UNIQUE NOT NULL,
+                value_mnt REAL    NOT NULL,
+                from_addr TEXT    NOT NULL,
+                to_addr   TEXT    NOT NULL,
+                type      TEXT    NOT NULL,
+                ai_signal TEXT    DEFAULT '',
+                tags      TEXT    DEFAULT '[]',
+                extra     TEXT    DEFAULT '{}'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+    conn.close()
+    print(f"[DB] База данных инициализирована: {DB_FILE}")
+
+# =============================================================================
+# МЕТА-ТАБЛИЦА — чекпоинты (last_block и другие настройки)
+# =============================================================================
+
+async def save_meta(key: str, value: str) -> None:
+    """Сохраняет или обновляет пару ключ/значение в таблице meta."""
+    def _sync() -> None:
+        conn = sqlite3.connect(DB_FILE)
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        conn.close()
+    await asyncio.to_thread(_sync)
+
+async def load_meta(key: str, default: str | None = None) -> str | None:
+    """Читает значение из таблицы meta; возвращает default если ключ не найден."""
+    def _sync() -> str | None:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else default
+    return await asyncio.to_thread(_sync)
+
+# =============================================================================
+# ЧТЕНИЕ АЛЕРТОВ ИЗ SQLITE
+# ИСПРАВЛЕНИЕ 2 — фильтрация, сортировка и лимит выполняются на уровне SQL,
+# а не через read_all + Python-итерацию по всем записям.
+# =============================================================================
+
+async def read_alerts(
+    limit: int | None = None,
+    since: datetime | None = None,
+    order_by_value: bool = False,
+) -> list[dict]:
+    """
+    Читает алерты из таблицы alerts и возвращает список словарей.
+    Поля tags (JSON-массив) и extra (JSON-объект) десериализуются автоматически.
+
+    Параметры:
+        limit          — максимальное количество возвращаемых записей.
+        since          — если задан, возвращаются только записи timestamp >= since.
+        order_by_value — если True, сортировка по value_mnt DESC; иначе по id DESC.
+    """
+    def _sync() -> list[dict]:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+
+        query = "SELECT * FROM alerts"
+        params: list = []
+        conditions: list[str] = []
+
+        if since:
+            conditions.append("timestamp >= ?")
+            params.append(since.isoformat())
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        if order_by_value:
+            query += " ORDER BY value_mnt DESC"
+        else:
+            query += " ORDER BY id DESC"
+
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        cur = conn.execute(query, params)
+        rows = cur.fetchall()
+        conn.close()
+
+        result = []
+        for row in rows:
+            entry = dict(row)
+            try:
+                entry["tags"] = json.loads(entry.get("tags") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                entry["tags"] = []
+            try:
+                extra = json.loads(entry.pop("extra") or "{}")
+                if extra:
+                    entry.update(extra)
+            except (json.JSONDecodeError, TypeError):
+                entry.pop("extra", None)
+            result.append(entry)
+        return result
+
+    return await asyncio.to_thread(_sync)
+
+# =============================================================================
+# ЗАПИСЬ АЛЕРТА В SQLITE
+#
+# Дедупликация реализована через UNIQUE(tx_hash) + INSERT OR IGNORE.
+# Если rowcount == 0 — транзакция уже была обработана ранее; возвращаем False.
+# Если rowcount == 1 — новая запись; возвращаем True.
+# Множество processed_hashes в памяти больше не нужно.
+# Все операции с БД выполняются в потоке через asyncio.to_thread.
+# =============================================================================
+
+async def save_alert(
+    tx_hash: str,
+    value_mnt: float,
+    from_addr: str,
+    to_addr: str,
+    event_type: str,
+    ai_signal: str = "",
+    extra: dict = None,
+    tags: list[str] = None,
+) -> bool:
+    """
+    Сохраняет алерт в SQLite.
+    Возвращает True если запись была новой, False если дубликат (уже существовал).
+    """
+    ts         = datetime.now(timezone.utc).isoformat()
+    tags_json  = json.dumps(tags or [], ensure_ascii=False)
+    extra_json = json.dumps(extra or {}, ensure_ascii=False)
+
+    def _sync() -> bool:
+        conn = sqlite3.connect(DB_FILE)
+        with conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO alerts
+                    (timestamp, tx_hash, value_mnt, from_addr, to_addr,
+                     type, ai_signal, tags, extra)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    tx_hash,
+                    round(float(value_mnt), 6),
+                    from_addr,
+                    to_addr,
+                    event_type,
+                    ai_signal,
+                    tags_json,
+                    extra_json,
+                ),
+            )
+            was_inserted = cur.rowcount == 1
+        conn.close()
+        return was_inserted
+
+    was_inserted = await asyncio.to_thread(_sync)
+    if was_inserted:
+        tag_str = f" tags={tags}" if tags else ""
+        print(f"[DB] Алерт '{event_type}' сохранён | {tx_hash[:14]}...{tag_str}")
+    else:
+        print(f"[DB] Дубликат пропущен: {tx_hash[:14]}...")
+    return was_inserted
+
+# =============================================================================
+# ОТПРАВКА В TELEGRAM
+# ИСПРАВЛЕНИЕ 6 — Flood control: обработка HTTP 429 + корректный retry
+# =============================================================================
+
+@async_retry(max_attempts=5, base_delay=1.0, exceptions=(Exception,))
+async def send_telegram(message: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    resp = await asyncio.to_thread(
+        lambda: requests.post(url, json=payload, timeout=10)
+    )
+    if resp.status_code == 429:
+        retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+        print(f"[TG] Rate limit. Жду {retry_after}s...")
+        await asyncio.sleep(retry_after)
+        raise RuntimeError("Rate limited — retry")
+    if not resp.ok:
+        raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
+    print("[TG] Уведомление отправлено.")
+
+# =============================================================================
+# AI-АНАЛИЗ (агрегированный)
+# =============================================================================
+
+def analyze_batch_sync(summary_lines: list[str]) -> str:
+    if qwen_client is None:
+        return ""
+    price, change_24h = get_mnt_price()
+    if price is not None and change_24h is not None:
+        price_context = f"Current MNT price: ${price:.4f} (24h change: {change_24h:+.2f}%)"
+    elif price is not None:
+        price_context = f"Current MNT price: ${price:.4f} (24h change: N/A)"
+    else:
+        price_context = "Current MNT price: N/A (data unavailable)"
+    summary_text = "\n".join(summary_lines)
+    try:
+        response = qwen_client.chat.completions.create(
+            model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a crypto analyst. You receive a batch summary of "
+                        "on-chain MNT transactions over a time window, including "
+                        "wallet labels (Smart Money, CEX, DeFi Trader, etc.) "
+                        "and the current market price of MNT. "
+                        "Output only: overall signal (buy / sell / watch), "
+                        "then 1-2 sentences of reasoning, mentioning notable wallets."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{price_context}\n\n"
+                        f"Aggregated Mantle activity:\n\n{summary_text}\n\n"
+                        "What is the overall signal?"
+                    ),
+                },
+            ],
+            # ИСПРАВЛЕНИЕ 3 — строка stream=False удалена (дефолтное значение)
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[WARN] Ошибка Qwen API (batch): {e}")
+        return ""
+
+async def analyze_batch(summary_lines: list[str]) -> str:
+    return await asyncio.to_thread(analyze_batch_sync, summary_lines)
+
+# =============================================================================
+# ALPHA SCORE — вычисление
+# =============================================================================
+
+def _parse_signal_direction(ai_signal: str) -> str:
+    low = ai_signal.lower()
+    if "sell" in low:
+        return "sell"
+    if "buy" in low:
+        return "buy"
+    return "watch"
+
+def _wallet_reputation_score(batch: list[dict]) -> int:
+    # Исправление 3 — учитываем оба адреса (from и to)
+    seen:  set[str] = set()
+    total: int      = 0
+    for entry in batch:
+        candidates = (
+            (entry["from_addr"].lower(), entry.get("from_tags", [])),
+            (entry["to_addr"].lower(),   entry.get("to_tags",   [])),
+        )
+        for addr, tags in candidates:
+            if addr in seen:
+                continue
+            seen.add(addr)
+            max_w = max((TAG_CATEGORY_WEIGHTS.get(t, 0) for t in tags), default=0)
+            total += max_w
+    return min(total, 40)
+
+def _volume_score(total_mnt: float) -> int:
+    if total_mnt <= 0:
+        return 0
+    return min(30, int(math.log10(max(total_mnt, 1)) * 6))
+
+def _market_alignment_score(signal_dir: str, change_24h: float | None) -> int:
+    if change_24h is None:
+        return 10
+    if signal_dir == "sell":
+        if change_24h <= -5:  return 30
+        if change_24h <= -2:  return 25
+        if change_24h <   0:  return 20
+        if change_24h <   2:  return 10
+        return 5
+    if signal_dir == "buy":
+        if change_24h >= 5:   return 28
+        if change_24h >= 2:   return 22
+        if change_24h >  0:   return 15
+        if change_24h > -2:   return 10
+        return 5
+    return 8  # watch
+
+def compute_alpha_score(
+    batch: list[dict],
+    ai_signal: str,
+    price: float | None,
+    change_24h: float | None,
+) -> tuple[int, str]:
+    signal_dir = _parse_signal_direction(ai_signal) if ai_signal else "watch"
+    total_mnt  = sum(e["value_mnt"] for e in batch)
+    w_rep    = _wallet_reputation_score(batch)
+    w_vol    = _volume_score(total_mnt)
+    w_market = _market_alignment_score(signal_dir, change_24h)
+    score = min(100, w_rep + w_vol + w_market)
+    print(
+        f"[ALPHA] rep={w_rep} vol={w_vol} market={w_market} "
+        f"score={score} signal={signal_dir} "
+        f"total_mnt={total_mnt:.0f} change_24h={change_24h}"
+    )
+    return score, signal_dir
+
+def format_alpha_line(score: int, signal_dir: str) -> str:
+    filled = round(score / 10)
+    bar    = "█" * filled + "░" * (10 - filled)
+    if score >= 75:
+        level_emoji = "🔴"
+    elif score >= 50:
+        level_emoji = "🟡"
+    else:
+        level_emoji = "🟢"
+    signal_labels = {"buy": "📈 buy", "sell": "📉 sell", "watch": "👀 watch"}
+    signal_str    = signal_labels.get(signal_dir, signal_dir)
+    return (
+        f"{level_emoji} <b>Alpha Score: {score}/100</b>  ({signal_str})\n"
+        f"<code>[{bar}]</code>"
+    )
+
+# =============================================================================
+# ДОБАВЛЕНИЕ В БУФЕР
+#
+# Дедупликация вынесена в save_alert(): INSERT OR IGNORE + rowcount.
+# Если save_alert вернул False — транзакция уже есть в БД, выходим.
+# processed_hashes и _hashes_lock полностью удалены.
+# =============================================================================
+
+async def fire_alert(
+    tx_hash: str,
+    value_mnt: float,
+    from_addr: str,
+    to_addr: str,
+    event_type: str,
+    extra_lines: list = None,
+    extra_log: dict = None,
+) -> None:
+    from_tags = get_wallet_tags(from_addr)
+    to_tags   = get_wallet_tags(to_addr)
+    combined_tags: list[str] = (
+        [f"FROM:{t}" for t in from_tags] + [f"TO:{t}" for t in to_tags]
+    )
+
+    print(f"[BUFFER][{event_type}] {value_mnt:.2f} MNT | {tx_hash} | tags={combined_tags}")
+
+    # Дедупликация на уровне БД: False = дубликат, пропускаем
+    was_new = await save_alert(
+        tx_hash    = tx_hash,
+        value_mnt  = float(value_mnt),
+        from_addr  = from_addr,
+        to_addr    = to_addr,
+        event_type = event_type,
+        ai_signal  = "pending",
+        extra      = extra_log,
+        tags       = combined_tags,
+    )
+    if not was_new:
+        return
+
+    tag_extra: list[str] = []
+    if from_tags:
+        tag_extra.append(f"🏷 <b>From-метки:</b> {', '.join(from_tags)}")
+    if to_tags:
+        tag_extra.append(f"🏷 <b>To-метки:</b> {', '.join(to_tags)}")
+
+    entry = {
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+        "tx_hash":     tx_hash,
+        "value_mnt":   float(value_mnt),
+        "from_addr":   from_addr,
+        "to_addr":     to_addr,
+        "type":        event_type,
+        "extra_lines": (extra_lines or []) + tag_extra,
+        "tags":        combined_tags,
+        "from_tags":   from_tags,
+        "to_tags":     to_tags,
+    }
+
+    async with _buffer_lock:
+        pending_alerts.append(entry)
+
+# =============================================================================
+# АГРЕГАЦИЯ И ОТПРАВКА ОТЧЁТА
+# =============================================================================
+
+async def aggregate_and_send() -> None:
+    global _last_alpha
+
+    async with _buffer_lock:
+        if not pending_alerts:
+            print("[AGG] Буфер пуст - ничего не отправляем.")
+            return
+        batch = pending_alerts.copy()
+        pending_alerts.clear()
+
+    now_str    = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    window_min = AGGREGATION_WINDOW // 60
+    print(f"[AGG] Формируем отчёт: {len(batch)} транзакций за {window_min} мин.")
+
+    # Исправление 4 — await asyncio.to_thread для синхронной get_mnt_price
+    price, change_24h = await asyncio.to_thread(get_mnt_price)
+    price_line = format_price_line(price, change_24h)
+
+    grouped: dict[str, dict] = defaultdict(lambda: {"total_mnt": 0.0, "txs": []})
+    for entry in batch:
+        grouped[entry["from_addr"]]["total_mnt"] += entry["value_mnt"]
+        grouped[entry["from_addr"]]["txs"].append(entry)
+
+    ai_summary: list[str] = []
+    for addr, data in grouped.items():
+        from_tags = get_wallet_tags(addr)
+        tag_str   = f" [{', '.join(from_tags)}]" if from_tags else ""
+        types     = ", ".join({tx["type"] for tx in data["txs"]})
+        ai_summary.append(
+            f"Wallet {addr[:10]}...{tag_str}: "
+            f"{data['total_mnt']:.2f} MNT, "
+            f"{len(data['txs'])} tx(s), types: {types}"
+        )
+
+    ai_signal = await analyze_batch(ai_summary)
+
+    alpha_score, signal_dir = compute_alpha_score(
+        batch=batch, ai_signal=ai_signal, price=price, change_24h=change_24h,
+    )
+    alpha_line = format_alpha_line(alpha_score, signal_dir)
+
+    # ИСПРАВЛЕНИЕ 3 — запись _last_alpha под локом для защиты от гонки с cmd_alpha
+    async with _last_alpha_lock:
+        _last_alpha.update({
+            "score":       alpha_score,
+            "signal":      signal_dir,
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "total_mnt":   sum(e["value_mnt"] for e in batch),
+            "price":       price,
+            "change_24h":  change_24h,
+        })
+
+    type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤"}
+    type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи"}
+
+    lines: list[str] = [
+        f"📊 <b>Агрегированный отчёт Mantle</b> | {now_str}",
+        price_line,
+        alpha_line,
+        f"⏱ Окно: <b>{window_min} мин</b>  |  Транзакций: <b>{len(batch)}</b>",
+        "",
+    ]
+
+    for addr, data in sorted(grouped.items(), key=lambda x: x[1]["total_mnt"], reverse=True):
+        short     = addr[:10] + "..."
+        from_tags = get_wallet_tags(addr)
+        tag_badge = f" <b>{format_tags(from_tags)}</b>" if from_tags else ""
+        lines.append(f"👤 <code>{short}</code>{tag_badge} — <b>{data['total_mnt']:.2f} MNT</b>")
+        for tx in data["txs"]:
+            icon     = type_icons.get(tx["type"], "🔔")
+            label    = type_labels.get(tx["type"], tx["type"])
+            scan     = f"{MANTLESCAN_URL}{tx['tx_hash']}"
+            to_short = tx["to_addr"][:10] + "..."
+            to_tags  = tx.get("to_tags", [])
+            to_badge = f" {format_tags(to_tags)}" if to_tags else ""
+            lines.append(
+                f"  {icon} {label} {tx['value_mnt']:.2f} MNT "
+                f"→ <code>{to_short}</code>{to_badge} "
+                f'<a href="{scan}">[tx]</a>'
+            )
+            for extra in tx.get("extra_lines", []):
+                lines.append(f"     {extra}")
+        lines.append("")
+
+    if ai_signal:
+        lines.append(f"🤖 <b>AI-сигнал:</b> {ai_signal}")
+
+    message = "\n".join(lines)
+
+    # ИСПРАВЛЕНИЕ 2 — безопасная обрезка HTML-сообщений по границе строки
+    if len(message) > 4000:
+        cut = message[:3980]
+        safe_cut = cut.rsplit("\n", 1)[0]
+        message = safe_cut + "\n\n<i>...обрезано</i>"
+
+    # Исправление 5 — await send_telegram
+    await send_telegram(message)
+    print(f"[AGG] Отчёт отправлен. Score={alpha_score} Кошельков: {len(grouped)}")
+
+# =============================================================================
+# ТАЙМЕР АГРЕГАЦИИ
+# =============================================================================
+
+async def aggregation_timer() -> None:
+    print(f"[AGG] Таймер запущен. Интервал: {AGGREGATION_WINDOW // 60} мин.")
+    while True:
+        await asyncio.sleep(AGGREGATION_WINDOW)
+        try:
+            await aggregate_and_send()
+        except Exception as e:
+            print(f"[ERROR] aggregate_and_send: {e}")
+
+# =============================================================================
+# ОБРАБОТКА НАТИВНЫХ ПЕРЕВОДОВ MNT
+# =============================================================================
+
+async def process_transaction(tx) -> None:
+    value_mnt = w3.from_wei(tx["value"], "ether")
+    if value_mnt <= THRESHOLD_MNT:
+        return
+    tx_hash   = tx["hash"].hex()
+    from_addr = tx["from"]
+    to_addr   = tx.get("to") or "Contract Creation"
+    event_type  = "transfer"
+    extra_lines = []
+    to_lower    = to_addr.lower()
+    from_lower  = from_addr.lower()
+    if to_lower in CEX_ADDRESSES_LOWER:
+        event_type = "cex_inflow"
+        # ИСПРАВЛЕНИЕ 3 — имя биржи берём из TAGGED_WALLETS_LOWER (первый тег)
+        cex_name = (TAGGED_WALLETS_LOWER.get(to_lower) or ["?"])[0]
+        extra_lines.append(f"🏦 <b>Биржа:</b> {cex_name}")
+    elif from_lower in CEX_ADDRESSES_LOWER:
+        event_type = "cex_outflow"
+        # ИСПРАВЛЕНИЕ 3 — имя биржи берём из TAGGED_WALLETS_LOWER (первый тег)
+        cex_name = (TAGGED_WALLETS_LOWER.get(from_lower) or ["?"])[0]
+        extra_lines.append(f"🏦 <b>Биржа:</b> {cex_name}")
+    await fire_alert(
+        tx_hash=tx_hash, value_mnt=float(value_mnt),
+        from_addr=from_addr, to_addr=to_addr,
+        event_type=event_type, extra_lines=extra_lines,
+    )
+
+# =============================================================================
+# ИСПРАВЛЕНИЕ 3 — Semaphore-обёртка для process_transaction
+# =============================================================================
+
+async def process_transaction_limited(tx) -> None:
+    async with _tx_semaphore:
+        await process_transaction(tx)
+
+# =============================================================================
+# ИСПРАВЛЕНИЕ 2 — Динамическое определение token0/token1 в decode_swap_log
+# Кэш позиций токена в пулах, чтобы не делать RPC-запрос на каждый лог.
+# =============================================================================
+
+_pool_token_order: dict[str, bool] = {}  # pool_address -> mnt_is_token0
+
+async def get_mnt_is_token0(pool_address: str) -> bool:
+    """Возвращает True если MNT (WMNT) является token0 в данном пуле.
+    Результат кэшируется в _pool_token_order."""
+    if pool_address in _pool_token_order:
+        return _pool_token_order[pool_address]
+
+    pool = w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=POOL_ABI)
+    token0 = await asyncio.to_thread(pool.functions.token0().call)
+    mnt_is_token0 = token0.lower() == MNT_TOKEN_ADDRESS.lower()
+    _pool_token_order[pool_address] = mnt_is_token0
+    return mnt_is_token0
+
+# =============================================================================
+# ОБРАБОТКА СОБЫТИЙ SWAP
+# ИСПРАВЛЕНИЕ 2 — decode_swap_log теперь async, определяет позицию MNT динамически.
+# ИСПРАВЛЕНИЕ 1 — добавлены поля mnt_is_out и direction для корректного
+#                 определения Buy/Sell независимо от позиции MNT в пуле.
+# =============================================================================
+
+async def decode_swap_log(log) -> dict | None:
+    try:
+        # Исправление 2 — корректный парсинг hex-данных
+        if isinstance(log["data"], bytes):
+            data = log["data"]
+        else:
+            hex_str = log["data"]
+            if hex_str.startswith(("0x", "0X")):
+                hex_str = hex_str[2:]
+            data = bytes.fromhex(hex_str)
+
+        if len(data) < 128:
+            return None
+        amount0_in  = int.from_bytes(data[0:32],   "big")
+        amount1_in  = int.from_bytes(data[32:64],  "big")
+        amount0_out = int.from_bytes(data[64:96],  "big")
+        amount1_out = int.from_bytes(data[96:128], "big")
+        sender = "0x" + log["topics"][1].hex()[-40:]
+        to     = "0x" + log["topics"][2].hex()[-40:]
+
+        # Исправление 2 — динамическое определение позиции MNT в пуле
+        mnt_is_token0 = await get_mnt_is_token0(log["address"])
+
+        if mnt_is_token0:
+            mnt_raw   = amount0_in if amount0_in > 0 else amount0_out
+            other_raw = amount1_in if amount1_in > 0 else amount1_out
+        else:
+            mnt_raw   = amount1_in if amount1_in > 0 else amount1_out
+            other_raw = amount0_in if amount0_in > 0 else amount0_out
+
+        # ИСПРАВЛЕНИЕ 1 — Buy MNT = MNT вышел из пула (amount_out > 0 для MNT)
+        #                  Sell MNT = MNT вошёл в пул (amount_in > 0 для MNT)
+        if mnt_is_token0:
+            mnt_is_out = amount0_out > 0
+        else:
+            mnt_is_out = amount1_out > 0
+
+        mnt_val = w3.from_wei(mnt_raw, "ether")
+        return {
+            "sender":        Web3.to_checksum_address(sender),
+            "to":            Web3.to_checksum_address(to),
+            "amount0_in":    amount0_in,
+            "amount1_in":    amount1_in,
+            "amount0_out":   amount0_out,
+            "amount1_out":   amount1_out,
+            "mnt_val":       float(mnt_val),
+            "other_raw":     other_raw,
+            "tx_hash":       log["transactionHash"].hex(),
+            "mnt_is_token0": mnt_is_token0,
+            "mnt_is_out":    mnt_is_out,
+            "direction":     "Buy MNT" if mnt_is_out else "Sell MNT",
+        }
+    except Exception as e:
+        print(f"[WARN] Ошибка декодирования Swap лога: {e}")
+        return None
+
+async def process_swap_logs(from_block: int, to_block: int) -> None:
+    try:
+        # ИСПРАВЛЕНИЕ 1 — используем rpc_get_logs вместо прямого w3.eth.get_logs
+        filter_params = {
+            "fromBlock": from_block,
+            "toBlock":   to_block,
+            "address":   MERCHANT_MOE_POOL,
+            "topics":    [SWAP_TOPIC],
+        }
+        logs = await rpc_get_logs(filter_params)
+        if logs:
+            print(f"[DEX] {len(logs)} Swap событий в блоках {from_block}-{to_block}")
+        tasks = []
+        for log in logs:
+            # Исправление 2 — decode_swap_log теперь async, используем await
+            decoded = await decode_swap_log(log)
+            if decoded is None or decoded["mnt_val"] <= THRESHOLD_MNT:
+                continue
+            tasks.append(fire_alert(
+                tx_hash     = decoded["tx_hash"],
+                value_mnt   = decoded["mnt_val"],
+                from_addr   = decoded["sender"],
+                to_addr     = decoded["to"],
+                event_type  = "swap",
+                extra_lines = [
+                    # ИСПРАВЛЕНИЕ 1 — используем decoded["direction"] вместо хардкоженной проверки
+                    f"🔁 <b>Тип:</b> {decoded['direction']}",
+                    f"📊 <b>Другой токен:</b> {decoded['other_raw']} wei",
+                ],
+                extra_log = {
+                    "amount0_in":  decoded["amount0_in"],
+                    "amount1_in":  decoded["amount1_in"],
+                    "amount0_out": decoded["amount0_out"],
+                    "amount1_out": decoded["amount1_out"],
+                },
+            ))
+        if tasks:
+            await asyncio.gather(*tasks)
+    except Exception as e:
+        print(f"[ERROR] process_swap_logs: {e}")
+
+# =============================================================================
+# ОСНОВНОЙ ЦИКЛ МОНИТОРИНГА
+#
+# last_block загружается из meta-таблицы при старте — блоки не теряются
+# при перезапуске бота. После обработки каждой группы блоков чекпоинт
+# сохраняется через save_meta("last_block", ...).
+# ИСПРАВЛЕНИЕ 5 — Лимит catchup-блоков при старте (MAX_CATCHUP_BLOCKS = 500).
+# ИСПРАВЛЕНИЕ 3 — asyncio.gather использует process_transaction_limited.
+# ИСПРАВЛЕНИЕ 2 — last_dex_block персистируется в SQLite meta-таблице.
+# =============================================================================
+
+async def monitor_blocks() -> None:
+    # ИСПРАВЛЕНИЕ 5 — загрузка last_block с ограничением на количество catchup-блоков
+    # ИСПРАВЛЕНИЕ 2 — загрузка last_dex_block из meta; стартует от last_block если нет чекпойнта
+    saved_block     = await load_meta("last_block")
+    saved_dex_block = await load_meta("last_dex_block")
+
+    if saved_block:
+        last_block = int(saved_block)
+        current_now = await rpc_get_block_number()
+        MAX_CATCHUP_BLOCKS = 500
+        if current_now - last_block > MAX_CATCHUP_BLOCKS:
+            print(f"[WARN] Пропущено {current_now - last_block} блоков. Начинаем с -{MAX_CATCHUP_BLOCKS}.")
+            last_block = current_now - MAX_CATCHUP_BLOCKS
+    else:
+        # ИСПРАВЛЕНИЕ 1 — используем rpc_get_block_number вместо прямого w3.eth.block_number
+        last_block = await rpc_get_block_number()
+
+    # last_dex_block стартует от last_block если нет чекпойнта
+    last_dex_block = int(saved_dex_block) if saved_dex_block else last_block
+
+    print(f"[INFO] Мониторинг с блока #{last_block}. DEX с #{last_dex_block}. Порог: {THRESHOLD_MNT} MNT")
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        try:
+            # ИСПРАВЛЕНИЕ 1 — используем rpc_get_block_number вместо прямого w3.eth.block_number
+            current_block = await rpc_get_block_number()
+            if current_block > last_block:
+                for block_num in range(last_block + 1, current_block + 1):
+                    print(f"[INFO] Блок #{block_num}...")
+                    # ИСПРАВЛЕНИЕ 1 — используем rpc_get_block вместо прямого w3.eth.get_block
+                    block = await rpc_get_block(block_num)
+                    txs   = block.get("transactions", [])
+                    print(f"       {len(txs)} транзакций")
+                    # ИСПРАВЛЕНИЕ 3 — Semaphore ограничивает параллелизм до 20 tx
+                    await asyncio.gather(*[process_transaction_limited(tx) for tx in txs])
+                last_block = current_block
+                await save_meta("last_block", str(last_block))
+            else:
+                print(f"[INFO] Новых блоков нет. Текущий: #{current_block}")
+            # Исправление 1 — DEX-сканирование без откатывания назад
+            dex_from = last_dex_block + 1
+            if dex_from <= current_block:
+                await process_swap_logs(dex_from, current_block)
+            # ИСПРАВЛЕНИЕ 2 — персистируем last_dex_block в SQLite после каждой итерации
+            last_dex_block = current_block
+            await save_meta("last_dex_block", str(last_dex_block))
+        except Exception as e:
+            print(f"[ERROR] monitor_blocks: {e}")
+
+# =============================================================================
+# TELEGRAM BOT: КОМАНДЫ
+# Все обработчики защищены проверкой is_authorized (ИСПРАВЛЕНИЕ 1).
+# =============================================================================
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message) -> None:
+    if not await is_authorized(message):
+        return
+
+    # Кнопка Mini App (определяем здесь, не снаружи)
+    start_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="📊 Открыть дашборд",
+            web_app=WebAppInfo(url=WEBAPP_URL),
+        )
+    ]])
+
+    text = (
+        "👋 <b>WhaleWatcher — Mantle Network Monitor</b>\n\n"
+        "Бот отслеживает крупные переводы MNT, свопы на Merchant Moe "
+        "и движения по кошелькам CEX/Smart Money в реальном времени.\n\n"
+        "<b>Доступные команды:</b>\n\n"
+        "/start — это сообщение\n"
+        "/webapp — открыть Mini App дашборд\n"
+        "/stats — статистика алертов за 24 часа\n"
+        "/top_whales — топ-10 крупнейших переводов\n"
+        "/alpha — последний Alpha Score\n"
+        "/set_threshold N — изменить порог (пример: <code>/set_threshold 10</code>)\n\n"
+        f"Текущий порог: <b>{THRESHOLD_MNT} MNT</b>"
+    )
+    await message.answer(text, reply_markup=start_keyboard)
+
+@dp.message(Command("webapp"))
+async def cmd_webapp(message: Message) -> None:
+    if not await is_authorized(message):
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="📊 WhaleWatcher Analytics",
+            web_app=WebAppInfo(url=WEBAPP_URL),
+        )
+    ]])
+
+    await message.answer(
+        "📊 <b>WhaleWatcher Mini App</b>\n\n"
+        "Нажми кнопку ниже, чтобы открыть дашборд:",
+        reply_markup=keyboard,
+    )
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Статистика за последние 24 часа из SQLite."""
+    if not await is_authorized(message):
+        return
+    # ИСПРАВЛЕНИЕ 2 — фильтрация по времени делегирована SQL-запросу (since=)
+    recent = await read_alerts(since=datetime.now(timezone.utc) - timedelta(hours=24))
+    if not recent:
+        await message.answer(
+            "📭 За последние 24 часа алертов не найдено.\n"
+            "Убедитесь, что мониторинг запущен."
+        )
+        return
+    by_type: dict[str, list[float]] = defaultdict(list)
+    for a in recent:
+        by_type[a.get("type", "unknown")].append(float(a.get("value_mnt", 0)))
+    all_values = [float(a.get("value_mnt", 0)) for a in recent]
+    avg_mnt   = sum(all_values) / len(all_values)
+    max_mnt   = max(all_values)
+    total_mnt = sum(all_values)
+    type_emoji = {
+        "transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤",
+    }
+    lines: list[str] = [
+        "📈 <b>Статистика за 24 часа</b>", "",
+        f"Всего алертов: <b>{len(recent)}</b>",
+        f"Суммарно: <b>{total_mnt:,.0f} MNT</b>",
+        f"Средняя сумма: <b>{avg_mnt:,.2f} MNT</b>",
+        f"Максимальная сумма: <b>{max_mnt:,.2f} MNT</b>",
+        "", "<b>По типам:</b>",
+    ]
+    for event_type, values in sorted(by_type.items(), key=lambda x: -len(x[1])):
+        emoji = type_emoji.get(event_type, "•")
+        t_sum = sum(values)
+        lines.append(
+            f"  {emoji} {event_type}: <b>{len(values)}</b> алерт(ов) | {t_sum:,.0f} MNT"
+        )
+    price, change_24h = await asyncio.to_thread(get_mnt_price)
+    lines.append("")
+    lines.append(format_price_line(price, change_24h))
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("top_whales"))
+async def cmd_top_whales(message: Message) -> None:
+    """Топ-10 крупнейших одиночных переводов за всё время."""
+    if not await is_authorized(message):
+        return
+    # ИСПРАВЛЕНИЕ 2 — сортировка и лимит делегированы SQL-запросу
+    top10 = await read_alerts(limit=10, order_by_value=True)
+    if not top10:
+        await message.answer("📭 Алертов пока нет.")
+        return
+    type_emoji = {
+        "transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤",
+    }
+    lines: list[str] = ["🐳 <b>Топ-10 крупнейших переводов</b>", ""]
+    for i, alert in enumerate(top10, start=1):
+        value      = float(alert.get("value_mnt", 0))
+        event_type = alert.get("type", "?")
+        emoji      = type_emoji.get(event_type, "•")
+        from_addr  = alert.get("from_addr", "?")
+        to_addr    = alert.get("to_addr", "?")
+        tx_hash    = alert.get("tx_hash", "")
+        ts_raw     = alert.get("timestamp", "")
+        tags       = alert.get("tags", [])
+        try:
+            ts     = datetime.fromisoformat(ts_raw)
+            ts_str = ts.strftime("%d.%m %H:%M")
+        except ValueError:
+            ts_str = "?"
+        tag_str = ""
+        if tags:
+            clean   = [t.split(":", 1)[-1] for t in tags[:2]]
+            tag_str = f" <i>[{', '.join(clean)}]</i>"
+        scan_link = f'<a href="{MANTLESCAN_URL}{tx_hash}">[tx]</a>' if tx_hash else ""
+        lines.append(
+            f"{i}. {emoji} <b>{value:,.2f} MNT</b>{tag_str}\n"
+            f"   From: <code>{from_addr[:12]}...</code>\n"
+            f"   To:   <code>{to_addr[:12]}...</code>\n"
+            f"   {ts_str}  {scan_link}"
+        )
+        lines.append("")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+@dp.message(Command("alpha"))
+async def cmd_alpha(message: Message) -> None:
+    """Показывает последний вычисленный Alpha Score."""
+    if not await is_authorized(message):
+        return
+
+    # ИСПРАВЛЕНИЕ 3 — читаем _last_alpha под локом, дальше работаем с копией
+    async with _last_alpha_lock:
+        data = dict(_last_alpha)
+
+    score      = data.get("score")
+    signal     = data.get("signal")
+    ts_raw     = data.get("computed_at")
+    total_mnt  = data.get("total_mnt")
+    price      = data.get("price")
+    change_24h = data.get("change_24h")
+
+    if score is None:
+        await message.answer(
+            "⏳ Alpha Score ещё не вычислялся.\n"
+            "Он появится после первого агрегированного отчёта."
+        )
+        return
+    try:
+        ts     = datetime.fromisoformat(ts_raw)
+        ts_str = ts.strftime("%d.%m.%Y %H:%M UTC")
+    except (TypeError, ValueError):
+        ts_str = "?"
+    signal_labels = {"buy": "📈 buy", "sell": "📉 sell", "watch": "👀 watch"}
+    signal_str    = signal_labels.get(signal or "watch", signal or "?")
+    if score >= 75:
+        level = "🔴 Высокий"
+    elif score >= 50:
+        level = "🟡 Средний"
+    else:
+        level = "🟢 Низкий"
+    filled = round(score / 10)
+    bar    = "█" * filled + "░" * (10 - filled)
+    lines: list[str] = [
+        "⚡ <b>Последний Alpha Score</b>", "",
+        f"<b>Score:</b> {score}/100  — {level}",
+        f"<b>Сигнал:</b> {signal_str}",
+        f"<code>[{bar}]</code>", "",
+        "<b>Детали окна:</b>",
+    ]
+    if total_mnt is not None:
+        lines.append(f"  Объём: <b>{total_mnt:,.2f} MNT</b>")
+    if price is not None:
+        price_str = f"${price:.4f}"
+        if change_24h is not None:
+            arrow     = "📈" if change_24h >= 0 else "📉"
+            sign      = "+" if change_24h >= 0 else ""
+            price_str += f"  ({arrow} {sign}{change_24h:.2f}%)"
+        lines.append(f"  Цена MNT: <b>{price_str}</b>")
+    else:
+        lines.append("  Цена MNT: <b>N/A</b>")
+    lines.append(f"  Вычислен: <i>{ts_str}</i>")
+    lines += ["", "<i>Обновляется с каждым агрегированным отчётом</i>"]
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("set_threshold"))
+async def cmd_set_threshold(message: Message) -> None:
+    """
+    Изменяет THRESHOLD_MNT и сохраняет новое значение в config.json.
+    Использование: /set_threshold 100
+    """
+    if not await is_authorized(message):
+        return
+    global THRESHOLD_MNT
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "⚠️ Укажите число после команды.\n"
+            f"Пример: <code>/set_threshold 100</code>\n\n"
+            f"Текущий порог: <b>{THRESHOLD_MNT} MNT</b>"
+        )
+        return
+    raw = parts[1].strip().replace(",", ".")
+    try:
+        new_threshold = float(raw)
+    except ValueError:
+        await message.answer(
+            f"❌ Не удалось распознать число: <code>{raw}</code>\n"
+            "Используйте целое или дробное (например, <code>75</code> или <code>0.5</code>)."
+        )
+        return
+    if new_threshold <= 0:
+        await message.answer("❌ Порог должен быть больше нуля.")
+        return
+    old_threshold = THRESHOLD_MNT
+    THRESHOLD_MNT = new_threshold
+    current_cfg = await asyncio.to_thread(load_config)
+    current_cfg["threshold_mnt"] = new_threshold
+    await asyncio.to_thread(save_config, current_cfg)
+    await message.answer(
+        f"✅ Порог алертов обновлён:\n"
+        f"  {old_threshold} MNT  →  <b>{new_threshold} MNT</b>\n\n"
+        "Новое значение применено немедленно и сохранено в <code>config.json</code>."
+    )
+    print(f"[CFG] Порог изменён: {old_threshold} -> {new_threshold} MNT")
+
+# =============================================================================
+# ТОЧКА ВХОДА
+# =============================================================================
+
+if __name__ == "__main__":
+    async def main() -> None:
+        init_db()   # создаём таблицы при первом запуске (idempotent)
+        print("[BOT] Запуск polling и мониторинга блоков...")
+        await asyncio.gather(
+            monitor_blocks(),
+            aggregation_timer(),
+            dp.start_polling(bot, allowed_updates=["message"]),
+        )
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[INFO] Остановлено.")
