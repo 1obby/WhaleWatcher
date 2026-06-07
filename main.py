@@ -1584,7 +1584,7 @@ async def cmd_start(message: Message) -> None:
         "• Верификация AI-сигналов (/accuracy)\n"
         "Подключение: @notuzo\n"
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=main_menu_keyboard())
 
 
 @dp.message(Command("stats"))
