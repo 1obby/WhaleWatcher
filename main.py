@@ -1927,7 +1927,7 @@ if __name__ == "__main__":
             resolve_predictions(),
             monitor_blocks(),
             aggregation_timer(),
-            dp.start_polling(bot, allowed_updates=["message"]),
+            dp.start_polling(bot, allowed_updates=["message", "callback_query"]),
         )
 
     try:
