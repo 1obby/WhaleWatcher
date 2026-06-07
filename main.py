@@ -1598,16 +1598,28 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 @dp.callback_query(lambda c: c.data in ("cmd_stats", "cmd_top_whales", "cmd_alpha", "cmd_accuracy"))
 async def handle_menu_callback(callback: CallbackQuery) -> None:
-    """Обрабатывает нажатия кнопок главного меню — переиспользует существующие хендлеры."""
-    await callback.answer()  # убираем часики на кнопке
-    if callback.data == "cmd_stats":
-        await cmd_stats(callback.message)
-    elif callback.data == "cmd_top_whales":
-        await cmd_top_whales(callback.message)
-    elif callback.data == "cmd_alpha":
-        await cmd_alpha(callback.message)
-    elif callback.data == "cmd_accuracy":
-        await cmd_accuracy(callback.message)
+    """Обрабатывает нажатия кнопок главного меню."""
+    print(f"[BTN] Нажата кнопка: {callback.data} от user_id={callback.from_user.id}")
+    await callback.answer()
+    # Создаём фейковый объект для передачи from_user в хендлеры
+    # callback.message.from_user — это БОТ, не пользователь
+    # Поэтому подменяем from_user вручную перед вызовом хендлера
+    original_from_user = callback.message.from_user
+    callback.message.from_user = callback.from_user  # подставляем реального пользователя
+    try:
+        if callback.data == "cmd_stats":
+            await cmd_stats(callback.message)
+        elif callback.data == "cmd_top_whales":
+            await cmd_top_whales(callback.message)
+        elif callback.data == "cmd_alpha":
+            await cmd_alpha(callback.message)
+        elif callback.data == "cmd_accuracy":
+            await cmd_accuracy(callback.message)
+    except Exception as e:
+        print(f"[BTN] Ошибка при обработке {callback.data}: {e}")
+        await callback.message.answer("⚠️ Ошибка при выполнении команды.")
+    finally:
+        callback.message.from_user = original_from_user  # восстанавливаем
 
 
 @dp.message(Command("start"))
