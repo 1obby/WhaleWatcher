@@ -1041,9 +1041,10 @@ async def aggregate_and_send() -> None:
             "change_24h":  change_24h,
         })
 
-    # Синхронизируем alpha_score с мета-таблицей для веб-дашборда
-    await asyncio.to_thread(save_meta, "alpha_score", str(alpha_score))
-    await asyncio.to_thread(save_meta, "alpha_signal", signal_dir)
+    # Синхронизируем alpha_score с мета-таблицей для веб-дашборда.
+    # save_meta — async def, вызываем напрямую (asyncio.to_thread для async-функций некорректен)
+    await save_meta("alpha_score", str(alpha_score))
+    await save_meta("alpha_signal", signal_dir)
 
     type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤"}
     type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи"}
