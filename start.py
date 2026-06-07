@@ -1,6 +1,3 @@
-"""
-start.py — Flask (Mini App) + бот (мониторинг Mantle) в одном процессе.
-"""
 import threading
 import os
 import runpy
