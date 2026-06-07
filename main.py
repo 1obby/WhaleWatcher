@@ -1601,25 +1601,38 @@ async def handle_menu_callback(callback: CallbackQuery) -> None:
     """Обрабатывает нажатия кнопок главного меню."""
     print(f"[BTN] Нажата кнопка: {callback.data} от user_id={callback.from_user.id}")
     await callback.answer()
-    # Создаём фейковый объект для передачи from_user в хендлеры
-    # callback.message.from_user — это БОТ, не пользователь
-    # Поэтому подменяем from_user вручную перед вызовом хендлера
-    original_from_user = callback.message.from_user
-    callback.message.from_user = callback.from_user  # подставляем реального пользователя
+
+    # aiogram-объекты — frozen pydantic-модели, поля напрямую не изменить.
+    # Создаём лёгкую обёртку поверх callback.message: все атрибуты делегируются
+    # оригинальному message через __getattr__, но from_user возвращает реального
+    # пользователя (callback.from_user), а не бота.
+    class _MessageProxy:
+        """Прокси вокруг Message с подменённым from_user."""
+        def __init__(self, msg, real_user):
+            object.__setattr__(self, "_msg",  msg)
+            object.__setattr__(self, "_user", real_user)
+
+        @property
+        def from_user(self):
+            return object.__getattribute__(self, "_user")
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_msg"), name)
+
+    proxy = _MessageProxy(callback.message, callback.from_user)
+
     try:
         if callback.data == "cmd_stats":
-            await cmd_stats(callback.message)
+            await cmd_stats(proxy)
         elif callback.data == "cmd_top_whales":
-            await cmd_top_whales(callback.message)
+            await cmd_top_whales(proxy)
         elif callback.data == "cmd_alpha":
-            await cmd_alpha(callback.message)
+            await cmd_alpha(proxy)
         elif callback.data == "cmd_accuracy":
-            await cmd_accuracy(callback.message)
+            await cmd_accuracy(proxy)
     except Exception as e:
         print(f"[BTN] Ошибка при обработке {callback.data}: {e}")
         await callback.message.answer("⚠️ Ошибка при выполнении команды.")
-    finally:
-        callback.message.from_user = original_from_user  # восстанавливаем
 
 
 @dp.message(Command("start"))
