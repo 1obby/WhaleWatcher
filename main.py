@@ -1588,6 +1588,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🎯 Alpha Score",  callback_data="cmd_alpha"),
             InlineKeyboardButton(text="🔒 Accuracy PRO", callback_data="cmd_accuracy"),
         ],
+        [
+            # Кнопка /pro — информация о PRO-подписке
+            InlineKeyboardButton(text="⭐ PRO-версия",   callback_data="cmd_pro"),
+        ],
     ]
     # Кнопка Web App — добавляется только если WEBAPP_URL задан в окружении
     if WEBAPP_URL:
@@ -1600,7 +1604,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@dp.callback_query(lambda c: c.data in ("cmd_stats", "cmd_top_whales", "cmd_alpha", "cmd_accuracy"))
+@dp.callback_query(lambda c: c.data in ("cmd_stats", "cmd_top_whales", "cmd_alpha", "cmd_accuracy", "cmd_pro"))
 async def handle_menu_callback(callback: CallbackQuery) -> None:
     """Обрабатывает нажатия кнопок главного меню."""
     print(f"[BTN] Нажата кнопка: {callback.data} от user_id={callback.from_user.id}")
@@ -1634,6 +1638,8 @@ async def handle_menu_callback(callback: CallbackQuery) -> None:
             await cmd_alpha(proxy)
         elif callback.data == "cmd_accuracy":
             await cmd_accuracy(proxy)
+        elif callback.data == "cmd_pro":
+            await cmd_pro(proxy)
     except Exception as e:
         print(f"[BTN] Ошибка при обработке {callback.data}: {e}")
         await callback.message.answer("⚠️ Ошибка при выполнении команды.")
@@ -1641,32 +1647,55 @@ async def handle_menu_callback(callback: CallbackQuery) -> None:
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
+    """Приветственное сообщение — без рекламы и без списка команд."""
     if not await is_authorized(message):
         return
     text = (
         "👋 <b>WhaleWatcher — Mantle Network Monitor</b>\n\n"
-        "Бот отслеживает крупные переводы MNT, свопы на Merchant Moe "
-        "и движения по кошелькам CEX/Smart Money в реальном времени.\n\n"
-        "<b>Доступные команды:</b>\n\n"
-        "/start — это сообщение\n"
-        "/stats — статистика алертов за последние 24 часа\n"
-        "/top_whales — топ-10 крупнейших переводов за всё время\n"
-        "/alpha — последний Alpha Score\n"
-        "/accuracy — точность AI-сигналов (верификация)\n"
-        "/set_threshold N — изменить порог алертов (MNT)\n"
-        "          Пример: <code>/set_threshold 100</code>\n\n"
-        f"Текущий порог: <b>{THRESHOLD_MNT} MNT</b>\n"
-        "\n⭐ <b>PRO-версия — $29/мес:</b>\n"
-        "• Полная статистика за 24ч\n"
-        "• Топ-10 кошельков\n"
-        "• Верификация AI-сигналов (/accuracy)\n"
-        "Подключение: @notuzo\n"
+        "Отслеживаю китов в реальном времени:\n"
+        "• Крупные переводы MNT\n"
+        "• Свопы на Merchant Moe и Agni Finance\n"
+        "• Движения CEX / Smart Money кошельков\n\n"
+        "/help — список команд"
     )
     # Отправляем приветствие с inline-клавиатурой главного меню
     await message.answer(text, reply_markup=main_menu_keyboard())
 
 
-@dp.message(Command("stats"))
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    """Выводит список всех доступных команд с кратким описанием."""
+    if not await is_authorized(message):
+        return
+    threshold = THRESHOLD_MNT
+    text = (
+        "📋 <b>Команды WhaleWatcher</b>\n\n"
+        "/stats — статистика за 24 часа\n"
+        "/top_whales — крупнейшие переводы\n"
+        "/alpha — последний Alpha Score\n"
+        "/accuracy — точность AI-сигналов 🔒 PRO\n"
+        f"/set_threshold N — порог алертов (сейчас: <b>{threshold} MNT</b>)\n\n"
+        "/pro — подробнее о PRO-версии"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("pro"))
+async def cmd_pro(message: Message) -> None:
+    """Информация о PRO-подписке и способ подключения."""
+    if not await is_authorized(message):
+        return
+    text = (
+        "⭐ <b>WhaleWatcher PRO — $29/мес</b>\n\n"
+        "Включает:\n"
+        "• Полная статистика за 24ч\n"
+        "• Топ-10 крупнейших кошельков\n"
+        "• Верификация AI-сигналов (/accuracy)\n\n"
+        "Подключение: @notuzo"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
 async def cmd_stats(message: Message) -> None:
     """Статистика за последние 24 часа из SQLite."""
     if not await is_authorized(message):
