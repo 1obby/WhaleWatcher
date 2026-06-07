@@ -1,5 +1,9 @@
 # =============================================================================
-# v13 v0.2.7
+# Mantle Network — мониторинг + агрегация + тегирование кошельков
+# v8: +авторизация, +dynamic token0/token1, +semaphore, +price_cache lock,
+#     +catchup cap, +flood control send_telegram
+# v9: +Agni Finance (Uniswap V3 fork), +decode_agni_swap_log, +DEX label in alerts
+# Зависимости: pip install web3 requests openai python-dotenv "aiogram>=3.4"
 # =============================================================================
 
 import asyncio
@@ -103,6 +107,23 @@ _required_env = ["MANTLE_RPC_URL", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
 _missing = [v for v in _required_env if not os.getenv(v)]
 if _missing:
     raise EnvironmentError(f"Не заданы переменные окружения: {', '.join(_missing)}")
+
+# =============================================================================
+# FREEMIUM — PRO-пользователи
+# =============================================================================
+
+# PRO-пользователи — задаются вручную (в будущем через платёжную систему)
+# Формат: множество int ID. Добавлять через запятую.
+PRO_USER_IDS: set[int] = set()
+
+def is_pro(message) -> bool:
+    """Проверяет является ли пользователь PRO-подписчиком."""
+    return message.from_user.id in PRO_USER_IDS
+
+PRO_UPSELL = (
+    "\n\n🔒 <b>Полная статистика доступна в PRO-версии</b>\n"
+    "Подробнее: @whalewatcherhtBot → /subscribe"
+)
 
 # =============================================================================
 # DEX: Merchant Moe (Uniswap V2 fork)
@@ -1537,7 +1558,12 @@ async def cmd_start(message: Message) -> None:
         "/accuracy — точность AI-сигналов (верификация)\n"
         "/set_threshold N — изменить порог алертов (MNT)\n"
         "          Пример: <code>/set_threshold 100</code>\n\n"
-        f"Текущий порог: <b>{THRESHOLD_MNT} MNT</b>"
+        f"Текущий порог: <b>{THRESHOLD_MNT} MNT</b>\n"
+        "\n⭐ <b>PRO-версия — $29/мес:</b>\n"
+        "• Полная статистика за 24ч\n"
+        "• Топ-10 кошельков\n"
+        "• Верификация AI-сигналов (/accuracy)\n"
+        "Подключение: @notuzo\n"
     )
     await message.answer(text)
 
@@ -1548,17 +1574,22 @@ async def cmd_stats(message: Message) -> None:
     if not await is_authorized(message):
         return
     # ИСПРАВЛЕНИЕ 2 — фильтрация по времени делегирована SQL-запросу (since=)
-    recent = await read_alerts(since=datetime.now(timezone.utc) - timedelta(hours=24))
-    if not recent:
+    recent_all = await read_alerts(since=datetime.now(timezone.utc) - timedelta(hours=24))
+    if not recent_all:
         await message.answer(
             "📭 За последние 24 часа алертов не найдено.\n"
             "Убедитесь, что мониторинг запущен."
         )
         return
+
+    # Freemium: Free-пользователи видят только 3 последних алерта
+    limit = 50 if is_pro(message) else 3  # Free: только 3 последних алерта
+    recent = recent_all[:limit]
+
     by_type: dict[str, list[float]] = defaultdict(list)
-    for a in recent:
+    for a in recent_all:  # статистика считается по всем, даже для Free (общие цифры)
         by_type[a.get("type", "unknown")].append(float(a.get("value_mnt", 0)))
-    all_values = [float(a.get("value_mnt", 0)) for a in recent]
+    all_values = [float(a.get("value_mnt", 0)) for a in recent_all]
     avg_mnt   = sum(all_values) / len(all_values)
     max_mnt   = max(all_values)
     total_mnt = sum(all_values)
@@ -1567,7 +1598,7 @@ async def cmd_stats(message: Message) -> None:
     }
     lines: list[str] = [
         "📈 <b>Статистика за 24 часа</b>", "",
-        f"Всего алертов: <b>{len(recent)}</b>",
+        f"Всего алертов: <b>{len(recent_all)}</b>",
         f"Суммарно: <b>{total_mnt:,.0f} MNT</b>",
         f"Средняя сумма: <b>{avg_mnt:,.2f} MNT</b>",
         f"Максимальная сумма: <b>{max_mnt:,.2f} MNT</b>",
@@ -1582,7 +1613,13 @@ async def cmd_stats(message: Message) -> None:
     price, change_24h = await asyncio.to_thread(get_mnt_price)
     lines.append("")
     lines.append(format_price_line(price, change_24h))
-    await message.answer("\n".join(lines))
+
+    # Free-пользователям показываем пометку об ограничении
+    if not is_pro(message):
+        text = "\n".join(lines) + PRO_UPSELL
+    else:
+        text = "\n".join(lines)
+    await message.answer(text)
 
 
 @dp.message(Command("top_whales"))
@@ -1590,15 +1627,19 @@ async def cmd_top_whales(message: Message) -> None:
     """Топ-10 крупнейших одиночных переводов за всё время."""
     if not await is_authorized(message):
         return
+    # Freemium: Free-пользователи видят топ-3 вместо топ-10
+    limit = 10 if is_pro(message) else 3  # Free: топ-3 вместо топ-10
     # ИСПРАВЛЕНИЕ 2 — сортировка и лимит делегированы SQL-запросу
-    top10 = await read_alerts(limit=10, order_by_value=True)
+    top10 = await read_alerts(limit=limit, order_by_value=True)
     if not top10:
         await message.answer("📭 Алертов пока нет.")
         return
     type_emoji = {
         "transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤",
     }
-    lines: list[str] = ["🐳 <b>Топ-10 крупнейших переводов</b>", ""]
+    # Заголовок отражает реальный лимит для данного пользователя
+    top_label = "10" if is_pro(message) else "3"
+    lines: list[str] = [f"🐳 <b>Топ-{top_label} крупнейших переводов</b>", ""]
     for i, alert in enumerate(top10, start=1):
         value      = float(alert.get("value_mnt", 0))
         event_type = alert.get("type", "?")
@@ -1625,6 +1666,9 @@ async def cmd_top_whales(message: Message) -> None:
             f"   {ts_str}  {scan_link}"
         )
         lines.append("")
+    # Free-пользователям добавляем апсейл
+    if not is_pro(message):
+        lines.append(PRO_UPSELL)
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -1734,6 +1778,17 @@ async def cmd_set_threshold(message: Message) -> None:
 async def cmd_accuracy(message: Message) -> None:
     """Показывает статистику точности AI-сигналов BUY/SELL."""
     if not await is_authorized(message):
+        return
+    # Команда доступна только PRO-пользователям
+    if not is_pro(message):
+        await message.answer(
+            "🔒 <b>Команда /accuracy доступна только в PRO-версии</b>\n\n"
+            "Верификация AI-сигналов, история точности по 1ч/4ч/24ч — "
+            "это инструмент для серьёзных трейдеров.\n\n"
+            "Стоимость PRO: <b>$29/мес</b>\n"
+            "Для подключения: @notuzo",
+            parse_mode="HTML"
+        )
         return
     stats = await asyncio.to_thread(_get_accuracy_stats)
     await message.answer(stats, parse_mode="HTML")
