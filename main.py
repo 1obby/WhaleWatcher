@@ -121,9 +121,13 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "")  # URL мини-апп на Railway (о
 # FREEMIUM — PRO-пользователи
 # =============================================================================
 
-# PRO-пользователи — задаются вручную (в будущем через платёжную систему)
-# Формат: множество int ID. Добавлять через запятую.
-PRO_USER_IDS: set[int] = set()
+# PRO-пользователи — список user_id через запятую в .env
+# Пример: PRO_USER_IDS=123456789,987654321
+PRO_USER_IDS: set[int] = {
+    int(uid.strip())
+    for uid in os.getenv("PRO_USER_IDS", "").split(",")
+    if uid.strip().isdigit()
+}
 
 def is_pro(message) -> bool:
     """Проверяет является ли пользователь PRO-подписчиком."""
