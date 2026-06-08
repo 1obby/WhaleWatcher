@@ -1,3 +1,11 @@
+# =============================================================================
+# Mantle Network — мониторинг + агрегация + тегирование кошельков
+# v8: +авторизация, +dynamic token0/token1, +semaphore, +price_cache lock,
+#     +catchup cap, +flood control send_telegram
+# v9: +Agni Finance (Uniswap V3 fork), +decode_agni_swap_log, +DEX label in alerts
+# Зависимости: pip install web3 requests openai python-dotenv "aiogram>=3.4"
+# =============================================================================
+
 import asyncio
 import functools
 import json
@@ -18,10 +26,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    WebAppInfo,
-    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -750,23 +756,14 @@ def analyze_batch_sync(
                         "You are a professional on-chain analyst specializing in Mantle Network whale behavior.\n"
                         "Analyze the provided transaction batch and output a concise, actionable signal.\n\n"
                         "PATTERN RECOGNITION RULES (apply in order, first match wins):\n"
-                        # FIX-PROMPT: уточнено — CEX должен быть ПОЛУЧАТЕЛЕМ (депозит на биржу).
-                        # Старая формулировка не различала депозит и вывод, что давало
-                        # SELL-сигнал на CEX-withdrawal, который скорее бычий (накопление).
-                        "1. If >50% of transfers go TO CEX-tagged wallets (CEX is RECEIVER, not sender) → "
+                        "1. If >50% of transfers go to CEX-tagged wallets (Bybit, OKX, Binance, etc.) → "
                         'pattern: "CEX Deposit Flow", signal: SELL\n'
-                        "   IMPORTANT: If CEX-tagged wallet is the SENDER (withdrawal from exchange) → "
-                        "   this rule does NOT apply. Classify by destination wallet instead.\n"
                         "2. If transfer amounts are suspiciously uniform (all within 2% of each other) → "
                         'add flag: "Chunk Splitting Detected — automated distribution"\n'
                         "3. If OTC Distributor / Mega Whale is SENDER → "
                         'pattern: "Whale Distribution", signal: SELL\n'
                         "4. If Smart Money / OTC Distributor is RECEIVER → "
                         'pattern: "Smart Money Accumulation", signal: BUY\n'
-                        # FIX-PROMPT: новое правило 4b — CEX как отправитель означает вывод
-                        # с биржи, что чаще говорит о накоплении, а не о продаже.
-                        "4b. If CEX-tagged wallet is SENDER and destination is untagged or Smart Money → "
-                        'pattern: "CEX Withdrawal — potential accumulation", signal: WATCH\n'
                         "5. If large DEX swap BUY (Merchant Moe / Agni Finance) → "
                         'pattern: "DEX Demand Spike", signal: BUY\n'
                         "6. If large DEX swap SELL → "
@@ -842,24 +839,11 @@ async def analyze_batch(
 # ALPHA SCORE — вычисление
 # =============================================================================
 
-def _parse_signal_direction(ai_signal: str) -> str:  # FIX-PARSE
-    """Извлекает направление только из строки **Signal:** — не из всего текста.
-
-    Проблема старой версии: поиск "sell"/"buy" по всему ответу Qwen давал
-    ложные срабатывания — например, слово "sell" в названии паттерна
-    "DEX Supply Dump" или в описании правила приводило к неверному signal_dir.
-    Теперь парсим только строку вида **Signal: SELL** (первая строка ответа).
-    """
-    import re
-    # Ищем только в строке вида: **Signal: SELL** или **Signal: BUY**
-    match = re.search(r"\*\*Signal:\s*(SELL|BUY|WATCH)", ai_signal, re.IGNORECASE)
-    if match:
-        return match.group(1).lower()
-    # Fallback: первое вхождение в первой строке (если модель опустила **)
-    first_line = ai_signal.split("\n")[0].lower()
-    if "sell" in first_line:
+def _parse_signal_direction(ai_signal: str) -> str:
+    low = ai_signal.lower()
+    if "sell" in low:
         return "sell"
-    if "buy" in first_line:
+    if "buy" in low:
         return "buy"
     return "watch"
 
@@ -1597,80 +1581,56 @@ async def monitor_blocks() -> None:
 # =============================================================================
 
 # =============================================================================
-# INLINE-КЛАВИАТУРА ГЛАВНОГО МЕНЮ
+# ПОСТОЯННАЯ REPLY-КЛАВИАТУРА ГЛАВНОГО МЕНЮ
+# Отображается внизу экрана и не скрывается после нажатия (persistent=True).
+# Нажатие кнопки отправляет её текст как обычное сообщение — перехватывается
+# хендлером handle_menu_text, а не через callback_query.
 # =============================================================================
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню бота с inline-кнопками."""
-    rows = [
-        [
-            InlineKeyboardButton(text="📊 Статистика",   callback_data="cmd_stats"),
-            InlineKeyboardButton(text="🐳 Топ китов",    callback_data="cmd_top_whales"),
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура внизу экрана."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📈 Статистика"), KeyboardButton(text="🐳 Топ китов")],
+            [KeyboardButton(text="⚡ Alpha Score"), KeyboardButton(text="🎯 Точность AI")],
+            [KeyboardButton(text="⭐ PRO-версия"), KeyboardButton(text="❓ Помощь")],
         ],
-        [
-            InlineKeyboardButton(text="🎯 Alpha Score",  callback_data="cmd_alpha"),
-            InlineKeyboardButton(text="🔒 Accuracy PRO", callback_data="cmd_accuracy"),
-        ],
-        [
-            # Кнопка /pro — информация о PRO-подписке
-            InlineKeyboardButton(text="⭐ PRO-версия",   callback_data="cmd_pro"),
-        ],
-    ]
-    # Кнопка Web App — добавляется только если WEBAPP_URL задан в окружении
-    if WEBAPP_URL:
-        rows.append([
-            InlineKeyboardButton(
-                text="🌐 Открыть Dashboard",
-                web_app=WebAppInfo(url=WEBAPP_URL),
-            )
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        resize_keyboard=True,
+        persistent=True,   # не скрывается после нажатия
+        input_field_placeholder="Выберите команду...",
+    )
 
 
-@dp.callback_query(lambda c: c.data in ("cmd_stats", "cmd_top_whales", "cmd_alpha", "cmd_accuracy", "cmd_pro"))
-async def handle_menu_callback(callback: CallbackQuery) -> None:
-    """Обрабатывает нажатия кнопок главного меню."""
-    print(f"[BTN] Нажата кнопка: {callback.data} от user_id={callback.from_user.id}")
-    await callback.answer()
 
-    # aiogram-объекты — frozen pydantic-модели, поля напрямую не изменить.
-    # Создаём лёгкую обёртку поверх callback.message: все атрибуты делегируются
-    # оригинальному message через __getattr__, но from_user возвращает реального
-    # пользователя (callback.from_user), а не бота.
-    class _MessageProxy:
-        """Прокси вокруг Message с подменённым from_user."""
-        def __init__(self, msg, real_user):
-            object.__setattr__(self, "_msg",  msg)
-            object.__setattr__(self, "_user", real_user)
+# =============================================================================
+# ХЕНДЛЕР КНОПОК REPLY KEYBOARD
+# Reply Keyboard отправляет текст кнопки как обычное сообщение (не callback).
+# Перехватываем нужные тексты и вызываем соответствующие команды-функции.
+# =============================================================================
 
-        @property
-        def from_user(self):
-            return object.__getattribute__(self, "_user")
-
-        def __getattr__(self, name):
-            return getattr(object.__getattribute__(self, "_msg"), name)
-
-    proxy = _MessageProxy(callback.message, callback.from_user)
-
-    try:
-        if callback.data == "cmd_stats":
-            await cmd_stats(proxy)
-        elif callback.data == "cmd_top_whales":
-            await cmd_top_whales(proxy)
-        elif callback.data == "cmd_alpha":
-            await cmd_alpha(proxy)
-        elif callback.data == "cmd_accuracy":
-            await cmd_accuracy(proxy)
-        elif callback.data == "cmd_pro":
-            await cmd_pro(proxy)
-    except Exception as e:
-        print(f"[BTN] Ошибка при обработке {callback.data}: {e}")
-        await callback.message.answer("⚠️ Ошибка при выполнении команды.")
+@dp.message(lambda m: m.text in (
+    "📈 Статистика", "🐳 Топ китов", "⚡ Alpha Score",
+    "🎯 Точность AI", "⭐ PRO-версия", "❓ Помощь"
+))
+async def handle_menu_text(message: Message) -> None:
+    """Обрабатывает нажатия Reply Keyboard кнопок."""
+    print(f"[BTN] Reply кнопка: {message.text} от user_id={message.from_user.id}")
+    mapping = {
+        "📈 Статистика":  cmd_stats,
+        "🐳 Топ китов":   cmd_top_whales,
+        "⚡ Alpha Score": cmd_alpha,
+        "🎯 Точность AI": cmd_accuracy,
+        "⭐ PRO-версия":  cmd_pro,
+        "❓ Помощь":      cmd_help,
+    }
+    handler = mapping.get(message.text)
+    if handler:
+        await handler(message)
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    """Приветственное сообщение — без рекламы и без списка команд."""
+    """Приветственное сообщение — показывает Reply Keyboard внизу экрана."""
     if not is_authorized(message):
         return
     text = (
@@ -1681,8 +1641,8 @@ async def cmd_start(message: Message) -> None:
         "• Движения CEX / Smart Money кошельков\n\n"
         "/help — список команд"
     )
-    # Отправляем приветствие с inline-клавиатурой главного меню
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    # Отправляем приветствие с постоянной Reply Keyboard внизу экрана
+    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 
 @dp.message(Command("help"))
