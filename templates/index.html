@@ -389,6 +389,8 @@ function ring(s,sz=66){
 
 /* ── SPARKLINE SVG ── */
 function spark(data,w=76,h=26){
+  if(!data||data.length===0)return`<svg width="${w}" height="${h}"></svg>`;
+  if(data.length===1)data=[data[0],data[0]];
   const mn=Math.min(...data),mx=Math.max(...data),rng=mx-mn||1;
   const pts=data.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-mn)/rng)*(h-2)-1}`).join(' ');
   const up=data[data.length-1]>=data[0];
@@ -422,6 +424,7 @@ const rnd=(mn,mx)=>mn+(Math.random()*(mx-mn));
 async function loadStats(){
   try{
     const d=await(await fetch('/api/stats')).json();
+    if(!d||typeof d!=='object')return;
     const s=id=>document.getElementById(id);
     s('d-wal').textContent=d.unique_wallets||'—';
     s('d-txn').textContent=(d.last_24h?.count||0).toLocaleString();
@@ -469,6 +472,10 @@ async function loadPrice(){
 async function loadChart(){
   try{
     const data=await(await fetch('/api/chart/hourly')).json();
+    if(!Array.isArray(data)||data.length===0){
+      const el=document.getElementById('ch-d');el.textContent='';
+      return;
+    }
     const mk=(k,c,l)=>({label:l,data:data.map(d=>d[k]||0),backgroundColor:c,borderRadius:3,borderSkipped:false});
     const ctx=document.getElementById('ch').getContext('2d');
     if(alphaCh)alphaCh.destroy();
@@ -536,12 +543,13 @@ function renderTop5(){
   const top=walletsData.slice(0,5);
   document.getElementById('d-top5').innerHTML=top.map((w,i)=>{
     const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
-    const em=(w.label.match(/\p{Emoji}/u)||['🔷'])[0];
+    const lbl=w.label||'Unknown';
+    const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
     return`<div class="tw">
       <div class="tw-n">${i+1}</div>
       <div class="tw-ic" style="background:${bg}">${em}</div>
       <div class="tw-if">
-        <div class="tw-nm">${esc(w.label.replace(/^[\p{Emoji}\s]+/u,''))}</div>
+        <div class="tw-nm">${esc(lbl.replace(/^[\p{Emoji}\s]+/u,''))}</div>
         <div class="tw-ad" onclick="cp('${esc(w.addr)}')">${sh(w.addr)}</div>
       </div>
       <div class="tw-ri">
@@ -564,8 +572,9 @@ function renderWallets(){
   const stcol=w=>w.alpha>=75?'#ef4444':w.alpha>=50?'#f59e0b':'#10b981';
   document.getElementById('w-list').innerHTML=sortedW.map((w,i)=>{
     const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
-    const em=(w.label.match(/\p{Emoji}/u)||['🔷'])[0];
-    const nm=w.label.replace(/^[\p{Emoji}\s]+/u,'');
+    const lbl=w.label||'Unknown';
+    const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
+    const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'');
     const cb=catBadge(w.cat);
     return`<div class="wc" style="animation:fup .25s ease ${i*.03}s both">
       <div class="wc-stripe" style="background:${stcol(w)}"></div>
@@ -590,8 +599,9 @@ function renderWallets(){
 function renderPaperGrid(){
   const top=walletsData.slice(0,6);
   document.getElementById('wgrid').innerHTML=top.map((w,i)=>{
-    const em=(w.label.match(/\p{Emoji}/u)||['🔷'])[0];
-    const nm=w.label.replace(/^[\p{Emoji}\s]+/u,'').split(' ').slice(0,2).join(' ');
+    const lbl=w.label||'Unknown';
+    const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
+    const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'').split(' ').slice(0,2).join(' ');
     return`<div class="wi ${i===selWi?'on':''}" onclick="selW(${i},this)">
       <span class="wi-nm">${em} ${esc(nm)}</span>
       <span class="wi-a">α${w.alpha}</span>
@@ -607,7 +617,13 @@ function runSim(){
     return;
   }
   const btn=document.getElementById('simbtn');btn.disabled=true;btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Simulating…';
-  const w=walletsData[selWi]||walletsData[0];
+  const safeIdx=selWi>=0&&selWi<walletsData.length?selWi:0;
+  const w=walletsData[safeIdx];
+  if(!w){
+    document.getElementById('sres').innerHTML='<div class="em">⏳ Данные накапливаются. Вернитесь через несколько минут.</div>';
+    document.getElementById('sres').classList.add('on');
+    return;
+  }
   setTimeout(()=>{
     const alpha=w.alpha/100;let smart=10000,hodl=10000,wins=0,trades=0,best=0,worst=0;
     for(let d=0;d<selPer;d++){
@@ -680,9 +696,9 @@ async function loadSignals(){
           </div>
           <div class="sig-tx">${genText(a)}</div>
           <div class="sig-tags">
-            <span class="b ${typeBadge[a.type]||'bt'}">${typeLabel[a.type]||a.type.toUpperCase()}</span>
+            <span class="b ${typeBadge[a.type]||'bt'}">${typeLabel[a.type]||(a.type||'unknown').toUpperCase()}</span>
             <span class="b ${sgc}">${sgl}</span>
-            ${fmnt(a.value_mnt)>1000?'<span class="b btag">Large Volume</span>':''}
+            ${(a.value_mnt||0)>1000?'<span class="b btag">Large Volume</span>':''}
             ${a.from_label?`<span class="b btag">${esc(a.from_label.replace(/^[\p{Emoji}\s]+/u,''))}</span>`:''}
           </div>
         </div>
