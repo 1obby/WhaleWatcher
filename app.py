@@ -346,6 +346,80 @@ def api_top_wallets():
     return jsonify(result)
 
 
+@app.route("/api/wallet_spark/<addr>")
+def api_wallet_spark(addr: str):
+    """
+    GET /api/wallet_spark/<addr>?period=24h|3d|7d  (default: 3d)
+
+    Returns spark array + metadata for a wallet address.
+    Prefix = first 10 chars of addr (without leading 0x).
+    """
+    _EMPTY = {"spark": [], "first_seen": None, "total_points": 0}
+    try:
+        period = request.args.get("period", "3d").strip().lower()
+
+        PERIODS = {
+            "24h": {"points": 24, "step_hours": 1},
+            "3d":  {"points": 36, "step_hours": 2},
+            "7d":  {"points": 42, "step_hours": 4},
+        }
+        cfg = PERIODS.get(period, PERIODS["3d"])
+        n_points   = cfg["points"]
+        step_hours = cfg["step_hours"]
+
+        # Strip leading "0x" / "0X" for prefix matching
+        clean = addr.lstrip("0x").lstrip("0X") if addr.lower().startswith("0x") else addr
+        prefix = clean[:10]
+
+        now = datetime.now(timezone.utc)
+        db  = get_db()
+
+        spark_vals = []
+        for i in range(n_points):
+            bucket_end   = now - timedelta(hours=step_hours * (n_points - 1 - i))
+            bucket_start = bucket_end - timedelta(hours=step_hours)
+
+            row = db.execute("""
+                SELECT COALESCE(SUM(value_mnt), 0) AS vol
+                FROM alerts
+                WHERE (from_addr LIKE ? OR to_addr LIKE ?)
+                  AND timestamp >= ? AND timestamp < ?
+            """, (
+                f"%{prefix}%",
+                f"%{prefix}%",
+                bucket_start.isoformat(),
+                bucket_end.isoformat(),
+            )).fetchone()
+
+            spark_vals.append(float(row["vol"]) if row else 0.0)
+
+        # first_seen: earliest transaction timestamp for this wallet
+        first_row = db.execute("""
+            SELECT MIN(timestamp) AS ts FROM alerts
+            WHERE from_addr LIKE ? OR to_addr LIKE ?
+        """, (f"%{prefix}%", f"%{prefix}%")).fetchone()
+
+        first_seen = None
+        if first_row and first_row["ts"]:
+            try:
+                dt = datetime.fromisoformat(first_row["ts"].replace("Z", "+00:00"))
+                first_seen = int(dt.timestamp())
+            except Exception:
+                first_seen = None
+
+        total_points = sum(1 for v in spark_vals if v > 0)
+
+        return jsonify({
+            "spark":        spark_vals,
+            "first_seen":   first_seen,
+            "total_points": total_points,
+        })
+
+    except Exception as exc:
+        app.logger.error("wallet_spark error for %s: %s", addr, exc)
+        return jsonify(_EMPTY)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────────────────────
