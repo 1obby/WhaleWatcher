@@ -300,22 +300,15 @@ function ring(s,sz=66){
   const col=s>=75?'#ef4444':s>=50?'#f59e0b':'#10b981';
   return`<svg width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}" xmlns="http://www.w3.org/2000/svg"><circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="5"/><circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="5" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" stroke-linecap="round" transform="rotate(-90 ${cx} ${cy})"/><text x="${cx}" y="${cy+5}" text-anchor="middle" fill="${col}" font-size="13" font-weight="800" font-family="Poppins,sans-serif">${s}</text></svg>`;
 }
-function sparkSvg(data,sparkUp,w=76,h=26){
-  if(!data||data.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
-  const filtered=data.filter(v=>typeof v==='number'&&isFinite(v));
-  if(filtered.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
-  const firstNZ=filtered.findIndex(v=>v!==0);
-  const trimmed=firstNZ>0?filtered.slice(firstNZ):filtered;
-  const d2=trimmed.length===0?[0,0]:trimmed.length===1?[0,trimmed[0]]:trimmed;
-  const mn=Math.min(...d2),mx=Math.max(...d2),rng=mx-mn||1;
-  const pts=d2.map((v,i)=>`${(i/(d2.length-1))*w},${h-((v-mn)/rng)*(h-2)-1}`).join(' ');
-  const col=sparkUp===null?'#555':sparkUp?'#00ff88':'#ff4466';
-  return`<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg"><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
-}
-function computeSparkUp(w){
-  if(!w.hasData||w.firstNonzero===null||w.lastNonzero===null)return null;
-  if(w.firstNonzero===0)return null;
-  return w.lastNonzero>w.firstNonzero?true:w.lastNonzero<w.firstNonzero?false:null;
+function flowBar(inflow, outflow, w=76, h=8){
+  const total = inflow + outflow;
+  if(total < 0.01) return `<div style="width:${w}px;height:${h}px;border-radius:4px;background:rgba(255,255,255,.07)"></div>`;
+  const gPct = Math.round((inflow / total) * 100);
+  const rPct = 100 - gPct;
+  return `<div style="width:${w}px;height:${h}px;border-radius:4px;overflow:hidden;display:flex;gap:1px">
+    <div style="flex:${gPct};background:rgba(0,255,136,.35);border-radius:3px 0 0 3px"></div>
+    <div style="flex:${rPct};background:rgba(255,68,102,.35);border-radius:0 3px 3px 0"></div>
+  </div>`;
 }
 const CAT_REP={'Smart Money':15,'Mega Whale':15,'Active DeFi Trader':12,'Whale Cold Storage':12,'Accumulator':10,'High-freq Trader':10,'OTC Distributor':8,'CEX':8,'Potential Whale':8,'Large Accumulator':8,'High-frequency':6,'Personal Relay':6,'Large Sender':6,'Bybit-funded':4,'DEX':5,'Protocol':2,'Unknown':1,'Routing':4};
 function computeAlpha(cat,vol24,addr){
@@ -499,7 +492,6 @@ function renderTop5(){
     const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
     const lbl=w.label||'Unknown';
     const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
-    const sparkUp=w.netFlow>0?true:w.netFlow<0?false:null;
     const{str:pnlStr,cls:pnlClass,label:pnlLabel}=fmtNet(w.netFlow);
     return`<div class="tw">
       <div class="tw-n">${i+1}</div>
@@ -514,7 +506,7 @@ function renderTop5(){
           <span style="font-size:.72rem;font-weight:800" class="${pnlClass}">${pnlStr}</span>
           ${pnlLabel?`<span style="font-size:9px;opacity:.7;margin-left:3px">${pnlLabel}</span>`:''}
         </div>
-        <div style="line-height:0;margin-top:2px">${sparkSvg(w.spark,sparkUp)}</div>
+        <div style="line-height:0;margin-top:2px">${flowBar(w.netFlow>0?w.netFlow:0, w.netFlow<0?Math.abs(w.netFlow):0)}</div>
       </div>
     </div>`;
   }).join('');
@@ -536,7 +528,6 @@ function renderWallets(){
     const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
     const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'');
     const cb=catBadge(w.cat);
-    const sparkUp=w.netFlow>0?true:w.netFlow<0?false:null;
     const{str:pnlStr,cls:pnlClass,label:pnlLabel}=fmtNet(w.netFlow);
     return`<div class="wc" style="animation:fup .25s ease ${i*.03}s both">
       <div class="wc-stripe" style="background:${stcol(w)}"></div>
@@ -556,7 +547,7 @@ function renderWallets(){
           ${w.firstSeen?`<div class="mi"><i class="fa-regular fa-calendar"></i>${toMSK(w.firstSeen)}</div>`:''}
         </div>
       </div>
-      <div style="line-height:0">${sparkSvg(w.spark,sparkUp)}</div>
+      <div style="line-height:0">${flowBar(w.netFlow>0?w.netFlow:0, w.netFlow<0?Math.abs(w.netFlow):0)}</div>
     </div>`;
   }).join('');
 }
