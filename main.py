@@ -290,7 +290,7 @@ _last_alpha: dict = {
     "price":       None,
     "change_24h":  None,
 }
-_last_alpha_lock = asyncio.Lock()
+_last_alpha_lock: asyncio.Lock | None = None  # FIX-LOCK: инициализируем внутри event loop
 
 # =============================================================================
 # ПОДКЛЮЧЕНИЕ К СЕТИ
@@ -345,11 +345,20 @@ bot = Bot(
 dp = Dispatcher()
 
 # =============================================================================
-# ИСПРАВЛЕНИЕ 1 (авторизация) — вспомогательная функция сразу после инициализации бота
+# =============================================================================
+# ИСПРАВЛЕНИЕ 1 (авторизация) — вспомогательные функции сразу после инициализации бота
 # =============================================================================
 
-async def is_authorized(message: Message) -> bool:
-    return True  # открытый доступ для всех пользователей
+def is_authorized(message) -> bool:
+    """Проверяет что команду вызывает авторизованный пользователь.
+    /set_threshold доступен только владельцу. Остальные команды — всем."""
+    return True  # чтение доступно всем
+
+def is_admin(message) -> bool:
+    """Только владелец может менять настройки бота.
+    ADMIN_ID задаётся в .env: ADMIN_ID=123456789"""
+    admin_id = int(os.getenv("ADMIN_ID", "0"))
+    return message.from_user.id == admin_id
 
 # =============================================================================
 # БУФЕРЫ И БЛОКИРОВКИ
@@ -749,14 +758,23 @@ def analyze_batch_sync(
                         "You are a professional on-chain analyst specializing in Mantle Network whale behavior.\n"
                         "Analyze the provided transaction batch and output a concise, actionable signal.\n\n"
                         "PATTERN RECOGNITION RULES (apply in order, first match wins):\n"
-                        "1. If >50% of transfers go to CEX-tagged wallets (Bybit, OKX, Binance, etc.) → "
+                        # FIX-PROMPT: уточнено — CEX должен быть ПОЛУЧАТЕЛЕМ (депозит на биржу).
+                        # Старая формулировка не различала депозит и вывод, что давало
+                        # SELL-сигнал на CEX-withdrawal, который скорее бычий (накопление).
+                        "1. If >50% of transfers go TO CEX-tagged wallets (CEX is RECEIVER, not sender) → "
                         'pattern: "CEX Deposit Flow", signal: SELL\n'
+                        "   IMPORTANT: If CEX-tagged wallet is the SENDER (withdrawal from exchange) → "
+                        "   this rule does NOT apply. Classify by destination wallet instead.\n"
                         "2. If transfer amounts are suspiciously uniform (all within 2% of each other) → "
                         'add flag: "Chunk Splitting Detected — automated distribution"\n'
                         "3. If OTC Distributor / Mega Whale is SENDER → "
                         'pattern: "Whale Distribution", signal: SELL\n'
                         "4. If Smart Money / OTC Distributor is RECEIVER → "
                         'pattern: "Smart Money Accumulation", signal: BUY\n'
+                        # FIX-PROMPT: новое правило 4b — CEX как отправитель означает вывод
+                        # с биржи, что чаще говорит о накоплении, а не о продаже.
+                        "4b. If CEX-tagged wallet is SENDER and destination is untagged or Smart Money → "
+                        'pattern: "CEX Withdrawal — potential accumulation", signal: WATCH\n'
                         "5. If large DEX swap BUY (Merchant Moe / Agni Finance) → "
                         'pattern: "DEX Demand Spike", signal: BUY\n'
                         "6. If large DEX swap SELL → "
@@ -832,11 +850,24 @@ async def analyze_batch(
 # ALPHA SCORE — вычисление
 # =============================================================================
 
-def _parse_signal_direction(ai_signal: str) -> str:
-    low = ai_signal.lower()
-    if "sell" in low:
+def _parse_signal_direction(ai_signal: str) -> str:  # FIX-PARSE
+    """Извлекает направление только из строки **Signal:** — не из всего текста.
+
+    Проблема старой версии: поиск "sell"/"buy" по всему ответу Qwen давал
+    ложные срабатывания — например, слово "sell" в названии паттерна
+    "DEX Supply Dump" или в описании правила приводило к неверному signal_dir.
+    Теперь парсим только строку вида **Signal: SELL** (первая строка ответа).
+    """
+    import re
+    # Ищем только в строке вида: **Signal: SELL** или **Signal: BUY**
+    match = re.search(r"\*\*Signal:\s*(SELL|BUY|WATCH)", ai_signal, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    # Fallback: первое вхождение в первой строке (если модель опустила **)
+    first_line = ai_signal.split("\n")[0].lower()
+    if "sell" in first_line:
         return "sell"
-    if "buy" in low:
+    if "buy" in first_line:
         return "buy"
     return "watch"
 
@@ -1060,8 +1091,8 @@ async def aggregate_and_send() -> None:
         })
 
     # Синхронизируем alpha_score с мета-таблицей для веб-дашборда
-    await asyncio.to_thread(save_meta, "alpha_score", str(alpha_score))
-    await asyncio.to_thread(save_meta, "alpha_signal", signal_dir)
+    await save_meta("alpha_score", str(alpha_score))   # FIX-META-1: save_meta — async, to_thread недопустим
+    await save_meta("alpha_signal", signal_dir)
 
     type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤"}
     type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи"}
@@ -1648,7 +1679,7 @@ async def handle_menu_callback(callback: CallbackQuery) -> None:
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     """Приветственное сообщение — без рекламы и без списка команд."""
-    if not await is_authorized(message):
+    if not is_authorized(message):
         return
     text = (
         "👋 <b>WhaleWatcher — Mantle Network Monitor</b>\n\n"
@@ -1665,7 +1696,7 @@ async def cmd_start(message: Message) -> None:
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     """Выводит список всех доступных команд с кратким описанием."""
-    if not await is_authorized(message):
+    if not is_authorized(message):
         return
     threshold = THRESHOLD_MNT
     text = (
@@ -1683,7 +1714,7 @@ async def cmd_help(message: Message) -> None:
 @dp.message(Command("pro"))
 async def cmd_pro(message: Message) -> None:
     """Информация о PRO-подписке и способ подключения."""
-    if not await is_authorized(message):
+    if not is_authorized(message):
         return
     text = (
         "⭐ <b>WhaleWatcher PRO — $29/мес</b>\n\n"
@@ -1698,7 +1729,7 @@ async def cmd_pro(message: Message) -> None:
 
 async def cmd_stats(message: Message) -> None:
     """Статистика за последние 24 часа из SQLite."""
-    if not await is_authorized(message):
+    if not is_authorized(message):
         return
     # ИСПРАВЛЕНИЕ 2 — фильтрация по времени делегирована SQL-запросу (since=)
     recent_all = await read_alerts(since=datetime.now(timezone.utc) - timedelta(hours=24))
@@ -1752,7 +1783,7 @@ async def cmd_stats(message: Message) -> None:
 @dp.message(Command("top_whales"))
 async def cmd_top_whales(message: Message) -> None:
     """Топ-10 крупнейших одиночных переводов за всё время."""
-    if not await is_authorized(message):
+    if not is_authorized(message):
         return
     # Freemium: Free-пользователи видят топ-3 вместо топ-10
     limit = 10 if is_pro(message) else 3  # Free: топ-3 вместо топ-10
@@ -1802,7 +1833,7 @@ async def cmd_top_whales(message: Message) -> None:
 @dp.message(Command("alpha"))
 async def cmd_alpha(message: Message) -> None:
     """Показывает последний вычисленный Alpha Score."""
-    if not await is_authorized(message):
+    if not is_authorized(message):
         return
 
     # ИСПРАВЛЕНИЕ 3 — читаем _last_alpha под локом, дальше работаем с копией
@@ -1865,8 +1896,9 @@ async def cmd_set_threshold(message: Message) -> None:
     """
     Изменяет THRESHOLD_MNT и сохраняет новое значение в config.json.
     Использование: /set_threshold 100
+    Доступно только администратору (ADMIN_ID из .env).
     """
-    if not await is_authorized(message):
+    if not is_admin(message):  # FIX-ADMIN: только владелец меняет порог
         return
     global THRESHOLD_MNT
     parts = (message.text or "").strip().split(maxsplit=1)
@@ -1904,7 +1936,7 @@ async def cmd_set_threshold(message: Message) -> None:
 @dp.message(Command("accuracy"))
 async def cmd_accuracy(message: Message) -> None:
     """Показывает статистику точности AI-сигналов BUY/SELL."""
-    if not await is_authorized(message):
+    if not is_authorized(message):
         return
     # Команда доступна только PRO-пользователям
     if not is_pro(message):
@@ -1966,6 +1998,8 @@ def _get_accuracy_stats() -> str:
 
 if __name__ == "__main__":
     async def main() -> None:
+        global _last_alpha_lock
+        _last_alpha_lock = asyncio.Lock()  # FIX-LOCK: создаём внутри event loop, а не на уровне модуля
         init_db()   # создаём таблицы при первом запуске (idempotent)
         print("[BOT] Запуск polling и мониторинга блоков...")
         # FIX-G: включаем resolve_predictions в gather — исключения не будут молча проглочены
