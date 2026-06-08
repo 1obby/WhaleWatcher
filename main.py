@@ -95,7 +95,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY")
 
 MANTLESCAN_URL = "https://mantlescan.xyz/tx/"
-DB_FILE        = "alerts.db"   # SQLite вместо alerts.json
+DB_FILE = os.getenv("DB_FILE", "alerts.db")
 
 COINGECKO_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
