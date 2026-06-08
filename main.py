@@ -1691,7 +1691,7 @@ async def cmd_help(message: Message) -> None:
     if not is_authorized(message):
         return
     # Читаем актуальный порог из конфига (может быть изменён через /set_threshold)
-    threshold = _config.get("threshold", 50.0)
+    threshold = THRESHOLD_MNT
     text = (
         "❓ <b>Помощь WhaleWatcher</b>\n\n"
         "Все функции доступны через кнопки меню внизу экрана.\n\n"
