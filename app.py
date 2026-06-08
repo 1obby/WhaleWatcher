@@ -1,497 +1,695 @@
-"""
-WhaleWatcher Mini App — Flask Backend  v2
-Читает alerts.db (SQLite WAL), отдаёт REST API + Telegram WebApp.
-
-Зависимости: pip install flask gunicorn
-"""
-
-import json
-import os
-import sqlite3
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-from flask import Flask, g, jsonify, render_template, request
-
-# ──────────────────────────────────────────────────────────────────────────────
-# КОНФИГ
-# ──────────────────────────────────────────────────────────────────────────────
-
-BASE_DIR   = Path(__file__).parent
-DB_FILE    = os.getenv("DB_FILE",    str(BASE_DIR / "alerts.db"))
-PORT       = int(os.getenv("PORT",   5000))
-MANTLESCAN = "https://mantlescan.xyz/tx/"
-
-app = Flask(__name__)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CORS — необходим для Telegram WebView
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.after_request
-def cors(resp):
-    resp.headers["Access-Control-Allow-Origin"]  = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    resp.headers["X-Content-Type-Options"]        = "nosniff"
-    return resp
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DB HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_db() -> sqlite3.Connection:
-    if "db" not in g:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        g.db = conn
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(_=None):
-    db = g.pop("db", None)
-    if db:
-        db.close()
-
-
-def ensure_db() -> None:
-    """Создаёт схему БД если её нет (idempotent)."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("PRAGMA journal_mode=WAL")
-    with conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS alerts (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT    NOT NULL,
-                tx_hash   TEXT    UNIQUE NOT NULL,
-                value_mnt REAL    NOT NULL,
-                from_addr TEXT    NOT NULL,
-                to_addr   TEXT    NOT NULL,
-                type      TEXT    NOT NULL,
-                ai_signal TEXT    DEFAULT '',
-                tags      TEXT    DEFAULT '[]',
-                extra     TEXT    DEFAULT '{}'
-            );
-            CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_ts   ON alerts(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_type ON alerts(type);
-            CREATE INDEX IF NOT EXISTS idx_from ON alerts(from_addr);
-        """)
-    conn.close()
-    print(f"[DB] OK → {DB_FILE}")
-
-
-def migrate_from_json(path: str = "alerts.json") -> int:
-    """Импортирует alerts.json → SQLite при первом запуске."""
-    src = BASE_DIR / path
-    if not src.exists():
-        return 0
-    try:
-        data = json.loads(src.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[MIGRATE] Ошибка чтения {path}: {e}")
-        return 0
-
-    conn  = sqlite3.connect(DB_FILE)
-    count = 0
-    with conn:
-        for entry in data:
-            try:
-                conn.execute("""
-                    INSERT OR IGNORE INTO alerts
-                        (timestamp, tx_hash, value_mnt, from_addr,
-                         to_addr, type, ai_signal, tags)
-                    VALUES (?,?,?,?,?,?,?,?)
-                """, (
-                    entry.get("timestamp", ""),
-                    entry.get("tx_hash",   ""),
-                    float(entry.get("value_mnt", 0)),
-                    entry.get("from_addr", ""),
-                    entry.get("to_addr",   ""),
-                    entry.get("type",      "transfer"),
-                    entry.get("ai_signal", ""),
-                    json.dumps(entry.get("tags") or []),
-                ))
-                count += 1
-            except Exception:
-                pass
-    conn.close()
-    return count
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# WALLET REGISTRY  (из TAGGED_WALLETS в main.py)
-# ──────────────────────────────────────────────────────────────────────────────
-
-WALLET_LABELS: dict[str, tuple[str, str]] = {
-    # addr_lower: (label, category)
-    "0x0000004eba872864a71b957180eb17dff71bb8f1": ("🐋 Mega Whale",       "Smart Money"),
-    "0x88a8984f2b8507bbc1c699594e3a4ecdefed4784": ("❄️ Cold Storage",      "Smart Money"),
-    "0x7647b72b4c89446f7d86bb7a30fd51b6d91577aa": ("🔀 Personal Relay",   "Routing"),
-    "0xf22943d05ab93f63b0a229b12f4425e72a4c1f1c": ("🐳 Whale #1",          "Smart Money"),
-    "0x59800fc68c7039566ed7a04b0f735255093cac1d": ("🐳 Whale #2",          "Smart Money"),
-    "0x6117a8af9d748780051415433a5702ee5f669d2d": ("🐳 Whale #3",          "Smart Money"),
-    "0x0f0c716b007c289c0011e470cc7f14de4fe9fc80": ("🎯 Strategic #1",      "Smart Money"),
-    "0xa19ab9905dc9e4bcb8f982b063710a508b612434": ("🎯 Strategic #2",      "Smart Money"),
-    "0xa713fc94db054aa435af4d9c66c3433dca98559f": ("🎯 Strategic #3",      "Smart Money"),
-    "0x15bb5d31048381c84a157526cef9513531b8be1e": ("🏛 Inst. Fund",         "Smart Money"),
-    "0xeaf4311ee279734facf77d167eec277d8343603e": ("🧠 Smart Holder #1",   "Smart Money"),
-    "0x4edb32cfc71e6c404bea8bbbdc8d9b8e03b08235": ("🧠 Smart Holder #2",   "Smart Money"),
-    "0xd4d2e6ebca6c94dd28a0935ae468012fdda5d35a": ("🧠 Smart Holder #3",   "Smart Money"),
-    "0x682a1ab616f3ff8378392fbe6c8d17826081456f": ("⚡ DeFi Trader",       "Smart Money"),
-    "0xd8169f099ce16c87a99d2a8494023574b5eea9c5": ("⚡ High-freq Trader",  "Smart Money"),
-    "0x0d4dc3b8becc98782309e443a6da4b9455b5ca48": ("🏦 Bybit",             "CEX"),
-    "0x88a1493366d48225fc3cefbdae9ebb23e323ade3": ("🏦 Bybit",             "CEX"),
-    "0x588846213a30fd36244e0ae0ebb2374516da836c": ("🏦 Bybit Hot Relay",   "CEX"),
-    "0xc868d0ea71243f1580f934cdc59620603bf9f1f1": ("🏦 Bybit Hot Relay",   "CEX"),
-    "0x4a67e97e770de93952b8596f04c13ada0ab9a69c": ("🏦 Bybit Relay",       "CEX"),
-    "0xb38e8c17e38363af6ebdcb3dae12e0243582891d": ("🔶 Binance",           "CEX"),
-    "0x28c6c06298d514db089934071355e5743bf21d60": ("🔶 Binance",           "CEX"),
-    "0x2933782b5a8d72f2754103d1489614f29bfa4625": ("🟢 KuCoin",            "CEX"),
-    "0x013e138ef6008ae5fdfde29700e3f2bc61d21e3a": ("🦁 Merchant Moe",      "DEX"),
-    "0xb9d507990c009ed1ee853a07b6a20c0925dd8a08": ("⛓ Budget L2",          "Protocol"),
-    "0x78c1b0c915c4faa5fffa6cabf0219da63d7f4cb8": ("⛓ WMNT Token",         "Protocol"),
-    "0xed884f0460a634c69dbb7def54858465808aacef": ("⛓ Rewards Stn",        "Protocol"),
-    "0xcd9dab9fa5b55ee4569edc402d3206123b1285f4": ("⛓ Treasury FF",        "Protocol"),
-    "0x94fec56bbeceacc71c9e61623ace9f8e1b1cf473": ("⛓ Treasury L2",        "Protocol"),
-    "0x6906d4ac9236849a755d16b38945cdc44dc01d07": ("🔀 Routing Wallet",    "Routing"),
-    "0xe6aec6f5b4a21722d2663e0e2bf8cbe4d16c0747": ("📦 Large Sender",      "Potential"),
-    "0x193f3520fbc1948d46a4cf37f2d1b13ad6c5ea17": ("📦 Large Accum.",      "Potential"),
-    "0x4589ac7bc932b8c8e4ea001d44d40d5e4858b808": ("❓ Unknown",           "Unknown"),
-    "0x6d9982a5902227e7d6838f3e5da421de587e94b3": ("📜 DeFi Contract",     "Protocol"),
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<title>WhaleWatcher — Mantle</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{--bg:#080b14;--bg2:#0d1225;--card:rgba(255,255,255,0.04);--border:rgba(255,255,255,0.10);--border2:rgba(255,255,255,0.06);--a1:#7c3aed;--a2:#2563eb;--ag:rgba(124,58,237,0.4);--green:#10b981;--yellow:#f59e0b;--red:#ef4444;--cyan:#06b6d4;--t1:#f1f5f9;--t2:#94a3b8;--t3:#475569;--r:16px;--r2:12px;--r3:8px;--nav:64px;--hdr:56px;}
+html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-family:'Poppins',sans-serif;font-size:13px}
+.bg-mesh{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
+.bg-mesh::before{content:'';position:absolute;width:70vw;height:70vw;top:-25%;left:-20%;background:radial-gradient(circle,rgba(124,58,237,.14),transparent 65%);animation:drift 14s ease-in-out infinite alternate}
+.bg-mesh::after{content:'';position:absolute;width:60vw;height:60vw;bottom:-20%;right:-15%;background:radial-gradient(circle,rgba(37,99,235,.11),transparent 65%);animation:drift 18s ease-in-out infinite alternate-reverse}
+@keyframes drift{0%{transform:translate(0,0)}100%{transform:translate(5%,8%)}}
+#app{display:flex;flex-direction:column;height:100vh;height:100dvh;max-width:480px;margin:0 auto;position:relative;z-index:1}
+.hdr{flex-shrink:0;height:var(--hdr);padding:0 1rem;display:flex;align-items:center;justify-content:space-between;background:rgba(8,11,20,.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--border2);z-index:50}
+.logo{display:flex;align-items:center;gap:.5rem}
+.logo-ico{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--a1),var(--a2));display:flex;align-items:center;justify-content:center;font-size:.9rem;color:#fff}
+.logo-nm{font-size:1rem;font-weight:800;letter-spacing:-.3px}
+.logo-nm span{background:linear-gradient(135deg,#a78bfa,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hdr-r{display:flex;align-items:center;gap:.5rem}
+.live{display:flex;align-items:center;gap:.3rem;background:rgba(16,185,129,.12);color:var(--green);border-radius:100px;padding:.2rem .65rem;font-size:.65rem;font-weight:700}
+.live::before{content:'';width:5px;height:5px;border-radius:50%;background:var(--green);animation:blink 2s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+.hdr-t{font-size:.62rem;color:var(--t3);font-weight:500}
+#main{flex:1;overflow:hidden;position:relative}
+.sc{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding:.9rem .85rem calc(var(--nav)+1rem);opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .25s ease,transform .25s ease;-webkit-overflow-scrolling:touch}
+.sc.on{opacity:1;transform:translateY(0);pointer-events:all}
+.sc::-webkit-scrollbar{width:2px}
+.sc::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
+.nav{flex-shrink:0;height:var(--nav);background:rgba(8,11,20,.96);backdrop-filter:blur(20px);border-top:1px solid var(--border2);display:flex;align-items:center}
+.nb{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.2rem;cursor:pointer;padding:.4rem 0;border:none;background:none;transition:all .2s;position:relative}
+.nb i{font-size:1.05rem;color:var(--t3);transition:all .2s}
+.nb span{font-size:.6rem;font-weight:600;color:var(--t3);letter-spacing:.2px}
+.nb.on i,.nb.on span{color:#a78bfa}
+.nb.on i{filter:drop-shadow(0 0 6px rgba(167,139,250,.6))}
+.nb.on::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:24px;height:2px;background:#a78bfa;border-radius:2px 2px 0 0;top:auto;}
+.nb-dot{position:absolute;top:6px;right:calc(50% - 14px);width:7px;height:7px;border-radius:50%;background:var(--red);border:2px solid var(--bg)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:1rem;backdrop-filter:blur(12px);margin-bottom:.65rem}
+.card-ttl{font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--t3);margin-bottom:.75rem;display:flex;align-items:center;gap:.35rem}
+.gt{background:linear-gradient(135deg,#a78bfa,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.pbar{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:.75rem 1rem;display:flex;align-items:center;justify-content:space-between;margin-bottom:.65rem}
+.p-l{display:flex;align-items:center;gap:.6rem}
+.mnt-ico{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#1d4ed8,#7c3aed);display:flex;align-items:center;justify-content:center;font-size:.65rem;font-weight:800;color:#fff}
+.mnt-nm{font-size:.8rem;font-weight:700}
+.mnt-sb{font-size:.62rem;color:var(--t3);margin-top:1px}
+.p-val{font-size:1rem;font-weight:800;letter-spacing:-.3px}
+.p-chg{font-size:.7rem;font-weight:700;margin-top:2px;text-align:right}
+.sg{display:grid;grid-template-columns:repeat(3,1fr);gap:.55rem;margin-bottom:.65rem}
+.sc2{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:.75rem .7rem}
+.sc2-i{font-size:.62rem;color:var(--t3);margin-bottom:.22rem}
+.sc2-v{font-size:1.15rem;font-weight:800;letter-spacing:-.4px;line-height:1}
+.sc2-l{font-size:.6rem;color:var(--t3);margin-top:.2rem}
+.ab{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:1rem;margin-bottom:.65rem;position:relative;overflow:hidden;backdrop-filter:blur(12px)}
+.ab::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--a1),var(--a2),transparent)}
+.ab-top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:.7rem}
+.ab-lbl{font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--t3);margin-bottom:.3rem}
+.ab-num{font-size:2.5rem;font-weight:900;letter-spacing:-2px;line-height:1}
+.ab-sig{display:inline-flex;align-items:center;gap:.25rem;padding:.2rem .65rem;border-radius:100px;font-size:.68rem;font-weight:700;margin-top:.35rem}
+.ab-track{height:5px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden;margin-bottom:.65rem}
+.ab-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--a1),var(--a2));transition:width .9s ease}
+.ab-cs{display:grid;grid-template-columns:repeat(3,1fr);gap:.4rem}
+.ab-c{background:rgba(255,255,255,.04);border-radius:var(--r3);padding:.5rem;text-align:center}
+.ab-cv{font-size:1rem;font-weight:800;line-height:1}
+.ab-cl{font-size:.58rem;color:var(--t3);margin-top:2px}
+.ab-cm{font-size:.55rem;color:var(--t3)}
+.chwrap{height:145px;position:relative}
+.tw{display:flex;align-items:center;gap:.65rem;padding:.55rem 0;border-bottom:1px solid var(--border2)}
+.tw:last-child{border:none;padding-bottom:0}
+.tw:first-child{padding-top:0}
+.tw-n{font-size:.65rem;font-weight:700;color:var(--t3);width:14px;text-align:center;flex-shrink:0}
+.tw-ic{width:32px;height:32px;border-radius:var(--r3);display:flex;align-items:center;justify-content:center;font-size:.85rem;flex-shrink:0}
+.tw-if{flex:1;min-width:0}
+.tw-nm{font-size:.8rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tw-ad{font-size:.6rem;color:var(--t3);font-family:monospace;cursor:pointer;margin-top:1px}
+.tw-ad:hover{color:#a78bfa}
+.tw-ri{display:flex;flex-direction:column;align-items:flex-end;gap:.15rem}
+.wc{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:.85rem .9rem;margin-bottom:.55rem;display:flex;align-items:center;gap:.75rem;cursor:pointer;transition:border-color .18s,background .15s;position:relative}
+.wc:hover{border-color:rgba(167,139,250,.4);background:rgba(255,255,255,.06)}
+.wc-stripe{position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
+.wc-body{flex:1;min-width:0;margin-left:4px}
+.wc-r1{display:flex;align-items:center;justify-content:space-between;margin-bottom:.3rem}
+.wc-nm{font-size:.82rem;font-weight:700}
+.wc-pnl{font-size:.82rem;font-weight:800}
+.wc-r2{display:flex;align-items:center;gap:.15rem;flex-wrap:wrap;margin-bottom:.3rem}
+.wc-meta{display:flex;align-items:center;gap:.6rem}
+.mi{font-size:.68rem;color:var(--t3);display:flex;align-items:center;gap:.2rem}
+.mi i{font-size:.6rem}
+.sb{display:flex;gap:.4rem;overflow-x:auto;margin-bottom:.75rem;padding-bottom:2px;scrollbar-width:none}
+.sb::-webkit-scrollbar{display:none}
+.sbt{flex-shrink:0;padding:.28rem .7rem;border-radius:100px;font-size:.68rem;font-weight:600;border:1px solid var(--border);background:none;color:var(--t3);cursor:pointer;transition:all .18s;font-family:'Poppins',sans-serif;white-space:nowrap}
+.sbt.on{background:rgba(124,58,237,.2);border-color:rgba(167,139,250,.5);color:#a78bfa}
+.per{display:flex;gap:.5rem;margin-bottom:0}
+.pb{flex:1;padding:.6rem;border-radius:var(--r3);font-size:.82rem;font-weight:700;border:1px solid var(--border);background:var(--card);color:var(--t3);cursor:pointer;transition:all .18s;font-family:'Poppins',sans-serif;text-align:center}
+.pb.on{background:rgba(124,58,237,.2);border-color:rgba(167,139,250,.5);color:#a78bfa}
+.wgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:.45rem}
+.wi{padding:.6rem .75rem;border-radius:var(--r3);border:1px solid var(--border);background:var(--card);cursor:pointer;transition:all .18s;display:flex;align-items:center;justify-content:space-between}
+.wi.on{background:rgba(124,58,237,.2);border-color:rgba(167,139,250,.5)}
+.wi-nm{font-size:.75rem;font-weight:700}
+.wi-a{font-size:.65rem;color:var(--t3);font-weight:600}
+.wi.on .wi-a{color:#a78bfa}
+.simbt{width:100%;padding:.95rem;border-radius:var(--r);background:linear-gradient(135deg,var(--a1),var(--a2));color:#fff;font-family:'Poppins',sans-serif;font-size:.92rem;font-weight:700;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:.5rem;transition:all .25s}
+.simbt:hover{transform:translateY(-2px);box-shadow:0 8px 28px var(--ag)}
+.simbt:active{transform:scale(.97)}
+.simbt:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.sres{display:none;flex-direction:column;gap:.6rem;animation:fup .35s ease both}
+.sres.on{display:flex}
+@keyframes fup{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.rm{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:1.2rem 1rem;display:flex;justify-content:space-around;align-items:center}
+.rb{display:flex;flex-direction:column;align-items:center;gap:.2rem}
+.rv{font-size:1.85rem;font-weight:900;letter-spacing:-1px;line-height:1}
+.rl{font-size:.6rem;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.rdv{width:1px;height:46px;background:var(--border)}
+.rg{display:grid;grid-template-columns:repeat(2,1fr);gap:.55rem}
+.rm2{background:var(--card);border:1px solid var(--border);border-radius:var(--r3);padding:.7rem .8rem}
+.rm2v{font-size:1.05rem;font-weight:800}
+.rm2l{font-size:.62rem;color:var(--t3);margin-top:2px}
+.out{display:flex;align-items:center;justify-content:center;gap:.4rem;padding:.55rem;border-radius:var(--r3);font-size:.78rem;font-weight:700}
+.sigc{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:.9rem;margin-bottom:.55rem;display:flex;gap:.75rem;cursor:pointer;transition:border-color .18s;animation:fup .3s ease both}
+.sigc:hover{border-color:rgba(255,255,255,.14)}
+.sig-ic{width:38px;height:38px;border-radius:var(--r3);display:flex;align-items:center;justify-content:center;font-size:.95rem;flex-shrink:0}
+.sig-bd{flex:1;min-width:0}
+.sig-r1{display:flex;align-items:center;justify-content:space-between;margin-bottom:.3rem}
+.sig-wl{font-size:.78rem;font-weight:700}
+.sig-tm{font-size:.63rem;color:var(--t3)}
+.sig-tx{font-size:.75rem;color:var(--t2);line-height:1.55}
+.sig-tx .hl{color:#93c5fd;font-weight:600}
+.sig-tx .pos{color:var(--green);font-weight:600}
+.sig-tx .neg{color:var(--red);font-weight:600}
+.sig-tags{display:flex;gap:.35rem;margin-top:.45rem;flex-wrap:wrap}
+.fbar{display:flex;gap:.35rem;overflow-x:auto;margin-bottom:.6rem;padding-bottom:2px;scrollbar-width:none}
+.fbar::-webkit-scrollbar{display:none}
+.fbt{flex-shrink:0;padding:.28rem .65rem;border-radius:100px;font-size:.68rem;font-weight:600;border:1px solid var(--border);background:none;color:var(--t3);cursor:pointer;transition:all .18s;font-family:'Poppins',sans-serif;white-space:nowrap}
+.fbt.on{background:rgba(124,58,237,.2);border-color:rgba(167,139,250,.5);color:#a78bfa}
+.sr{display:flex;gap:.4rem;margin-bottom:.6rem}
+.inp{flex:1;background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:var(--r3);color:var(--t1);padding:.42rem .7rem;font-family:'Poppins',sans-serif;font-size:.78rem;outline:none}
+.inp::placeholder{color:var(--t3)}
+.inp:focus{border-color:rgba(167,139,250,.5)}
+.sel{background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:var(--r3);color:var(--t1);padding:.42rem .5rem;font-family:'Poppins',sans-serif;font-size:.75rem;outline:none}
+.ac{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:.85rem;margin-bottom:.5rem;cursor:pointer;transition:border-color .18s,background .15s;position:relative;overflow:hidden}
+.ac:hover{border-color:rgba(255,255,255,.14);background:rgba(255,255,255,.06)}
+.ac-st{position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
+.ac-r1{display:flex;align-items:center;justify-content:space-between;margin-bottom:.33rem;padding-left:9px}
+.ac-am{font-size:1.1rem;font-weight:800;letter-spacing:-.4px}
+.ac-t{font-size:.62rem;color:var(--t3)}
+.ac-r2{display:flex;align-items:center;gap:.3rem;flex-wrap:wrap;margin-bottom:.35rem;padding-left:9px}
+.ac-r3{display:flex;align-items:center;gap:.4rem;padding-left:9px}
+.ac-ad{display:flex;align-items:center;gap:.3rem;flex:1;min-width:0}
+.ac-a{display:flex;flex-direction:column;gap:1px;flex:1;min-width:0}
+.ac-lbl{font-size:.6rem;font-weight:700;color:#a78bfa}
+.ac-mn{font-family:'Courier New',monospace;font-size:.65rem;color:var(--t2);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ac-mn:hover{color:#a78bfa}
+.ac-arr{color:var(--t3);font-size:.65rem;flex-shrink:0}
+.exp{display:inline-flex;align-items:center;gap:.2rem;background:rgba(124,58,237,.15);color:#a78bfa;border-radius:6px;padding:.18rem .5rem;font-size:.62rem;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0}
+.b{display:inline-flex;align-items:center;gap:.15rem;padding:.1rem .45rem;border-radius:100px;font-size:.62rem;font-weight:700;white-space:nowrap}
+.bt{background:rgba(59,130,246,.15);color:#60a5fa}.bs{background:rgba(6,182,212,.15);color:#22d3ee}.bi{background:rgba(16,185,129,.15);color:#34d399}.bo{background:rgba(239,68,68,.15);color:#f87171}
+.bbuy{background:rgba(16,185,129,.15);color:var(--green)}.bsel{background:rgba(239,68,68,.15);color:var(--red)}.bwat{background:rgba(245,158,11,.15);color:var(--yellow)}.bpen{background:rgba(71,85,105,.18);color:var(--t3)}
+.btag{background:rgba(139,92,246,.12);color:#c4b5fd;font-size:.58rem}.bsm{background:rgba(124,58,237,.15);color:#a78bfa}.bcex{background:rgba(245,158,11,.12);color:#fcd34d}.bdex{background:rgba(6,182,212,.12);color:#67e8f9}.bpro{background:rgba(71,85,109,.15);color:var(--t2)}
+.ir{display:flex;align-items:center;justify-content:space-between;padding:.6rem 0;border-bottom:1px solid var(--border2)}
+.ir:last-child{border:none}
+.ik{font-size:.75rem;color:var(--t2);font-weight:500}
+.iv{font-size:.78rem;font-weight:700}
+.thr{display:inline-flex;align-items:center;gap:.3rem;background:rgba(245,158,11,.12);color:var(--yellow);border-radius:100px;padding:.2rem .65rem;font-size:.68rem;font-weight:700}
+.shdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.65rem}
+.sttl{font-size:.85rem;font-weight:700}
+.sact{font-size:.7rem;color:#a78bfa;font-weight:600;cursor:pointer}
+.ld{display:flex;align-items:center;justify-content:center;gap:.5rem;padding:2.5rem;color:var(--t3);font-size:.8rem}
+.em{text-align:center;padding:3rem 1rem;color:var(--t3);font-size:.8rem}
+.cbl{color:#60a5fa}.cgr{color:var(--green)}.cye{color:var(--yellow)}.crd{color:var(--red)}.cmu{color:var(--t3)}.cpu{color:#a78bfa}
+.fw8{font-weight:800}
+</style>
+</head>
+<body>
+<div class="bg-mesh"></div>
+<div id="app">
+<header class="hdr">
+  <div class="logo">
+    <div class="logo-ico"><i class="fa-solid fa-fish-fins"></i></div>
+    <div class="logo-nm">Whale<span>Watcher</span></div>
+  </div>
+  <div class="hdr-r">
+    <div class="live">LIVE</div>
+    <div class="hdr-t" id="hdr-t">—</div>
+  </div>
+</header>
+<div id="main">
+  <div class="sc on" id="s1">
+    <div class="pbar">
+      <div class="p-l">
+        <div class="mnt-ico">M</div>
+        <div><div class="mnt-nm">Mantle (MNT)</div><div class="mnt-sb">Mantle Network L2</div></div>
+      </div>
+      <div style="text-align:right">
+        <div class="p-val" id="mnt-p">$—</div>
+        <div class="p-chg" id="mnt-c">—</div>
+      </div>
+    </div>
+    <div class="sg">
+      <div class="sc2"><div class="sc2-i"><i class="fa-solid fa-fish-fins"></i> Tracked</div><div class="sc2-v cpu" id="d-wal">—</div><div class="sc2-l">кошельков</div></div>
+      <div class="sc2"><div class="sc2-i"><i class="fa-solid fa-bolt"></i> 24h тхн</div><div class="sc2-v" id="d-txn">—</div><div class="sc2-l">транзакций</div></div>
+      <div class="sc2"><div class="sc2-i"><i class="fa-solid fa-coins"></i> 24h объём</div><div class="sc2-v cye" id="d-vol">—</div><div class="sc2-l">MNT</div></div>
+    </div>
+    <div class="ab">
+      <div class="ab-top">
+        <div>
+          <div class="ab-lbl"><i class="fa-solid fa-chart-mixed"></i>&nbsp; Alpha Score</div>
+          <div class="ab-num cpu" id="a-n">—</div>
+          <div class="ab-sig" id="a-sig" style="margin-top:.35rem">— —</div>
+        </div>
+        <div id="a-ring"></div>
+      </div>
+      <div class="ab-track"><div class="ab-fill" id="a-bar" style="width:0%"></div></div>
+      <div class="ab-cs">
+        <div class="ab-c"><div class="ab-cv cpu" id="a-r">—</div><div class="ab-cl">Reputation</div><div class="ab-cm">/ 40</div></div>
+        <div class="ab-c"><div class="ab-cv cbl" id="a-v">—</div><div class="ab-cl">Volume</div><div class="ab-cm">/ 30</div></div>
+        <div class="ab-c"><div class="ab-cv cgr" id="a-m">—</div><div class="ab-cl">Market</div><div class="ab-cm">/ 30</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-ttl"><i class="fa-solid fa-chart-bar"></i> Alpha Composite <span style="font-weight:400;color:var(--t3)">7d</span><span class="ms-auto" id="ch-d" style="margin-left:auto;font-size:.7rem;padding:.15rem .5rem;border-radius:100px"></span></div>
+      <div class="chwrap"><canvas id="ch"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="shdr" style="margin-bottom:.5rem"><div class="sttl">Top Smart Wallets</div><div class="sact" onclick="go('s2')">View all →</div></div>
+      <div id="d-top5"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
+    </div>
+  </div>
+  <div class="sc" id="s2">
+    <div class="shdr"><div class="sttl">Smart Wallets <span style="color:var(--t3);font-weight:400" id="w-cnt"></span></div><span class="b bsm"><i class="fa-solid fa-network-wired"></i>&nbsp;Mantle</span></div>
+    <div class="sb" id="spark-period-bar" style="margin-bottom:.45rem">
+      <button class="sbt on" onclick="setSparkPeriod('24h',this)">24ч</button>
+      <button class="sbt" id="sp-btn-3d" onclick="setSparkPeriod('3d',this)">3д</button>
+      <button class="sbt" onclick="setSparkPeriod('7d',this)">7д</button>
+    </div>
+    <div class="sb" id="sort-bar">
+      <button class="sbt on" onclick="sortW('alpha',this)">Alpha ↓</button>
+      <button class="sbt" onclick="sortW('vol',this)">Объём</button>
+      <button class="sbt" onclick="sortW('txns',this)">Транзакции</button>
+      <button class="sbt" onclick="sortW('pnl',this)">PnL 30d</button>
+    </div>
+    <div id="w-list"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
+  </div>
+  <div class="sc" id="s3">
+    <div class="shdr"><div class="sttl">Paper Trading</div><span class="b btag"><i class="fa-solid fa-flask-vial"></i>&nbsp;Simulation</span></div>
+    <div class="card" style="margin-bottom:.65rem"><div class="card-ttl">Simulation Period</div><div class="per" id="per-sel">
+      <button class="pb on" onclick="setPer(7,this)">7 Days</button>
+      <button class="pb" onclick="setPer(14,this)">14 Days</button>
+      <button class="pb" onclick="setPer(30,this)">30 Days</button>
+    </div></div>
+    <div class="card" style="margin-bottom:.65rem"><div class="card-ttl">Copy Wallet (Smart Money)</div><div class="wgrid" id="wgrid"></div></div>
+    <button class="simbt" style="margin-bottom:.65rem" id="simbtn" onclick="runSim()"><i class="fa-solid fa-play"></i> Run Simulation</button>
+    <div class="sres" id="sres"></div>
+  </div>
+  <div class="sc" id="s4">
+    <div class="shdr"><div class="sttl">Alpha Signals</div><span class="b bi" id="sig-cnt">— New</span></div>
+    <div id="sig-list"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
+  </div>
+</div>
+<nav class="nav">
+  <button class="nb on" data-s="s1" onclick="go('s1',this)"><i class="fa-solid fa-gauge-high"></i><span>Dashboard</span></button>
+  <button class="nb" data-s="s2" onclick="go('s2',this)"><i class="fa-solid fa-wallet"></i><span>Wallets</span></button>
+  <button class="nb" data-s="s3" onclick="go('s3',this)"><i class="fa-solid fa-flask-vial"></i><span>Paper</span></button>
+  <button class="nb" data-s="s4" onclick="go('s4',this)" style="position:relative"><i class="fa-solid fa-bell"></i><span>Signals</span><div class="nb-dot" id="ndot"></div></button>
+</nav>
+</div>
+<script>
+const tg=window.Telegram?.WebApp;
+if(tg){tg.ready();tg.expand();try{tg.setHeaderColor('#080b14')}catch(_){};try{tg.setBackgroundColor('#080b14')}catch(_){}}
+const hap=t=>{try{tg?.HapticFeedback?.impactOccurred(t||'light')}catch(_){}}
+const hapN=t=>{try{tg?.HapticFeedback?.notificationOccurred(t||'success')}catch(_){}}
+let cur='s1';
+function go(id,btn){
+  if(id===cur&&!btn)return; hap();
+  document.querySelectorAll('.sc').forEach(s=>s.classList.remove('on'));
+  document.querySelectorAll('.nb').forEach(b=>b.classList.remove('on'));
+  document.getElementById(id).classList.add('on');
+  const nb=btn||document.querySelector(`.nb[data-s="${id}"]`);
+  if(nb)nb.classList.add('on'); cur=id;
+  if(tg?.BackButton){id!=='s1'?tg.BackButton.show():tg.BackButton.hide()}
+  if(id==='s4')document.getElementById('ndot').style.display='none';
 }
-
-
-def enrich(row) -> dict:
-    d = dict(row)
-    try:
-        d["tags"] = json.loads(d.get("tags") or "[]")
-    except Exception:
-        d["tags"] = []
-    d.pop("extra", None)
-
-    fa = d.get("from_addr", "").lower()
-    ta = d.get("to_addr",   "").lower()
-    fl = WALLET_LABELS.get(fa)
-    tl = WALLET_LABELS.get(ta)
-    d["from_label"] = fl[0] if fl else None
-    d["from_cat"]   = fl[1] if fl else None
-    d["to_label"]   = tl[0] if tl else None
-    d["to_cat"]     = tl[1] if tl else None
-    d["scan_url"]   = MANTLESCAN + d.get("tx_hash", "")
-    return d
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ROUTES — Frontend
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ROUTES — API
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.route("/api/alerts")
-def api_alerts():
-    """
-    GET /api/alerts
-    Params: limit, type, min_mnt, search, order (time|value)
-    """
-    limit  = min(int(request.args.get("limit",  50)), 500)
-    a_type = request.args.get("type",   "all")
-    min_v  = float(request.args.get("min_mnt", 0))
-    search = request.args.get("search", "").strip()
-    order  = request.args.get("order",  "time")
-
-    q, p, conds = "SELECT * FROM alerts", [], []
-
-    if a_type not in ("", "all"):
-        conds.append("type = ?")
-        p.append(a_type)
-    if min_v > 0:
-        conds.append("value_mnt >= ?")
-        p.append(min_v)
-    if search:
-        s = f"%{search.lower()}%"
-        conds.append("(LOWER(from_addr) LIKE ? OR LOWER(to_addr) LIKE ? "
-                     "OR LOWER(tx_hash) LIKE ?)")
-        p += [s, s, s]
-
-    if conds:
-        q += " WHERE " + " AND ".join(conds)
-
-    q += " ORDER BY " + ("value_mnt DESC" if order == "value" else "id DESC")
-    q += " LIMIT ?";  p.append(limit)
-
-    rows = [enrich(r) for r in get_db().execute(q, p).fetchall()]
-    return jsonify({"data": rows, "count": len(rows)})
-
-
-@app.route("/api/stats")
-def api_stats():
-    db = get_db()
-
-    tot_cnt, tot_vol, max_vol = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(value_mnt),0), "
-        "COALESCE(MAX(value_mnt),0) FROM alerts"
-    ).fetchone()
-
-    since24 = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    cnt24, vol24 = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(value_mnt),0) "
-        "FROM alerts WHERE timestamp >= ?", (since24,)
-    ).fetchone()
-
-    by_type = {}
-    for r in db.execute(
-        "SELECT type, COUNT(*), COALESCE(SUM(value_mnt),0) "
-        "FROM alerts GROUP BY type"
-    ).fetchall():
-        by_type[r[0]] = {"count": r[1], "volume": round(r[2], 2)}
-
-    uniq = db.execute(
-        "SELECT COUNT(DISTINCT from_addr) FROM alerts"
-    ).fetchone()[0]
-
-    last_row = db.execute(
-        "SELECT timestamp FROM alerts ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-
-    # Alpha Score из meta (пишется ботом)
-    alpha_row   = db.execute(
-        "SELECT value FROM meta WHERE key='last_alpha_score'"
-    ).fetchone()
-    signal_row  = db.execute(
-        "SELECT value FROM meta WHERE key='last_alpha_signal'"
-    ).fetchone()
-    thresh_row  = db.execute(
-        "SELECT value FROM meta WHERE key='threshold_mnt'"
-    ).fetchone()
-
-    return jsonify({
-        "total":          tot_cnt,
-        "total_volume":   round(tot_vol, 2),
-        "max_volume":     round(max_vol,  2),
-        "last_24h":       {"count": cnt24, "volume": round(vol24, 2)},
-        "by_type":        by_type,
-        "unique_wallets": uniq,
-        "last_ts":        last_row[0] if last_row else None,
-        "alpha_score":    int(alpha_row[0])  if alpha_row  else None,
-        "alpha_signal":   signal_row[0]       if signal_row else None,
-        "threshold_mnt":  float(thresh_row[0]) if thresh_row else 50.0,
-    })
-
-
-@app.route("/api/chart/hourly")
-def api_chart_hourly():
-    """Почасовые данные за 24 ч, разбитые по типу события."""
-    since  = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    rows   = get_db().execute("""
-        SELECT strftime('%H', timestamp) AS hr,
-               type,
-               COALESCE(SUM(value_mnt), 0) AS vol,
-               COUNT(*)                     AS cnt
-        FROM alerts WHERE timestamp >= ?
-        GROUP BY hr, type ORDER BY hr
-    """, (since,)).fetchall()
-
-    TYPES   = ("transfer", "swap", "cex_inflow", "cex_outflow")
-    buckets = {str(h).zfill(2): {t: 0.0 for t in TYPES} | {"cnt": 0}
-               for h in range(24)}
-
-    for r in rows:
-        hr = str(r["hr"]).zfill(2)
-        t  = r["type"] if r["type"] in TYPES else "transfer"
-        buckets[hr][t]    += r["vol"]
-        buckets[hr]["cnt"] += r["cnt"]
-
-    now_utc = datetime.now(timezone.utc)
-    now_h   = now_utc.hour
-    ordered = []
-    for i in range(24):
-        hr_int = (now_h - 23 + i) % 24
-        hr     = str(hr_int).zfill(2)
-        # unix timestamp начала бакета (UTC, начало часа)
-        bucket_dt = now_utc.replace(hour=hr_int, minute=0, second=0, microsecond=0)
-        if hr_int > now_h:          # бакет из вчерашнего дня
-            bucket_dt -= timedelta(days=1)
-        bucket_ts = int(bucket_dt.timestamp())
-        ordered.append({"label": f"{hr}:00", "bucket_timestamp": bucket_ts, **buckets[hr]})
-
-    return jsonify(ordered)
-
-
-@app.route("/api/top_wallets")
-def api_top_wallets():
-    rows = get_db().execute("""
-        SELECT from_addr, COUNT(*) cnt, COALESCE(SUM(value_mnt),0) vol
-        FROM alerts GROUP BY from_addr ORDER BY vol DESC LIMIT 15
-    """).fetchall()
-
-    result = []
-    for r in rows:
-        info  = WALLET_LABELS.get(r["from_addr"].lower())
-        label = info[0] if info else r["from_addr"][:10] + "…"
-        cat   = info[1] if info else "Unknown"
-        result.append({
-            "addr":  r["from_addr"],
-            "count": r["cnt"],
-            "vol":   round(r["vol"], 2),
-            "label": label,
-            "cat":   cat,
-        })
-    return jsonify(result)
-
-
-@app.route("/api/wallet_spark/<addr>")
-def api_wallet_spark(addr: str):
-    """
-    GET /api/wallet_spark/<addr>?period=24h|3d|7d  (default: 3d)
-
-    Возвращает кумулятивный нетто-поток кошелька по бакетам.
-    net_i = inflow_i - outflow_i
-    cumulative[i] = sum(net_0 .. net_i)
-
-    Prefix = первые 10 символов addr (без 0x).
-
-    Ответ:
-      spark          — массив кумулятивных значений (фикс. длины: 24/36/42)
-      first_nonzero  — значение первой ненулевой точки кумулятива (или null)
-      last_nonzero   — значение последней ненулевой точки (или null)
-      has_data       — true если хотя бы 1 бакет ненулевой по нетто
-      first_seen     — unix-timestamp первой транзакции кошелька (или null)
-      inflow         — суммарный приток за весь период
-      outflow        — суммарный отток за весь период
-    """
-    _EMPTY = {
-        "spark": [], "first_nonzero": None, "last_nonzero": None,
-        "has_data": False, "first_seen": None,
-        "inflow": 0.0, "outflow": 0.0,
+if(tg?.BackButton)tg.BackButton.onClick(()=>{hap();go('s1')});
+const fmnt=v=>{v=parseFloat(v)||0;if(v>=1e6)return(v/1e6).toFixed(2)+'M';if(v>=1e3)return(v/1e3).toFixed(1)+'K';return v.toFixed(2)};
+const sh=a=>(!a||a.length<12)?a||'—':a.slice(0,8)+'…'+a.slice(-4);
+const rt=ts=>{try{const s=Math.floor((Date.now()-new Date(ts))/1000);if(s<60)return s+'с назад';if(s<3600)return Math.floor(s/60)+'м назад';if(s<86400)return Math.floor(s/3600)+'ч назад';return new Date(ts).toLocaleDateString('ru',{day:'2-digit',month:'2-digit'})}catch{return'—'}};
+const fdt=ts=>{try{return new Date(ts).toLocaleString('ru',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}catch{return ts||'—'}};
+const psig=r=>{if(!r)return['pen','⏳','bpen'];const l=r.trim().toLowerCase();if(l.startsWith('buy'))return['buy','📈 Buy','bbuy'];if(l.startsWith('sell'))return['sel','📉 Sell','bsel'];if(l.startsWith('watch'))return['wat','👀 Watch','bwat'];return['wat','👀','bwat']};
+const ptyp=t=>({transfer:['bt','🔔 Transfer'],swap:['bs','🔄 Swap'],cex_inflow:['bi','🏦📥 CEX In'],cex_outflow:['bo','🏦📤 CEX Out']}[t]||['bt',t]);
+const stc=t=>({transfer:'#3b82f6',swap:'#06b6d4',cex_inflow:'#10b981',cex_outflow:'#ef4444'}[t]||'#7c3aed');
+const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function cp(a){hap('medium');navigator.clipboard?.writeText(a).then(()=>{tg?.showPopup?.({title:'✅ Скопировано',message:sh(a),buttons:[{type:'ok'}]})}).catch(()=>{})}
+function ring(s,sz=66){
+  const r=(sz-10)/2,cx=sz/2,cy=sz/2,c=2*Math.PI*r,off=c*(1-s/100);
+  const col=s>=75?'#ef4444':s>=50?'#f59e0b':'#10b981';
+  return`<svg width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}" xmlns="http://www.w3.org/2000/svg"><circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="5"/><circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="5" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" stroke-linecap="round" transform="rotate(-90 ${cx} ${cy})"/><text x="${cx}" y="${cy+5}" text-anchor="middle" fill="${col}" font-size="13" font-weight="800" font-family="Poppins,sans-serif">${s}</text></svg>`;
+}
+function sparkSvg(data,sparkUp,w=76,h=26){
+  if(!data||data.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
+  const filtered=data.filter(v=>typeof v==='number'&&isFinite(v));
+  if(filtered.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
+  const firstNZ=filtered.findIndex(v=>v!==0);
+  const trimmed=firstNZ>0?filtered.slice(firstNZ):filtered;
+  const d2=trimmed.length===0?[0,0]:trimmed.length===1?[0,trimmed[0]]:trimmed;
+  const mn=Math.min(...d2),mx=Math.max(...d2),rng=mx-mn||1;
+  const pts=d2.map((v,i)=>`${(i/(d2.length-1))*w},${h-((v-mn)/rng)*(h-2)-1}`).join(' ');
+  const col=sparkUp===null?'#555':sparkUp?'#00ff88':'#ff4466';
+  return`<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg"><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+function computeSparkUp(w){
+  if(!w.hasData||w.firstNonzero===null||w.lastNonzero===null)return null;
+  if(w.firstNonzero===0)return null;
+  return w.lastNonzero>w.firstNonzero?true:w.lastNonzero<w.firstNonzero?false:null;
+}
+const CAT_REP={'Smart Money':15,'Mega Whale':15,'Active DeFi Trader':12,'Whale Cold Storage':12,'Accumulator':10,'High-freq Trader':10,'OTC Distributor':8,'CEX':8,'Potential Whale':8,'Large Accumulator':8,'High-frequency':6,'Personal Relay':6,'Large Sender':6,'Bybit-funded':4,'DEX':5,'Protocol':2,'Unknown':1,'Routing':4};
+function computeAlpha(cat,vol24,addr){
+  const rep=Math.min(40,CAT_REP[cat]||4);
+  const vs=Math.min(30,Math.floor(Math.log10(Math.max(vol24,1))*6));
+  const h=(addr||'').split('').reduce((s,c,i)=>s+(c.charCodeAt(0)*(i+1)),0);
+  const mkt=8+(h%14);
+  return Math.min(99,rep+vs+mkt);
+}
+function toMSK(ts){
+  if(!ts)return'—';
+  try{
+    const unix=typeof ts==='number'?ts:Math.floor(new Date(ts).getTime()/1000);
+    const d=new Date((unix+3*3600)*1000);
+    return d.toLocaleString('ru-RU',{timeZone:'UTC',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' МСК';
+  }catch{return'—'}
+}
+let walletsData=[],sortedW=[],selPer=7,selWi=0,alphaCh=null;
+let sparkPeriod='24h';
+const rnd=(mn,mx)=>mn+(Math.random()*(mx-mn));
+async function loadStats(){
+  try{
+    const d=await fetch('/api/stats').then(r=>r.ok?r.json():Promise.reject(r.status)).catch(()=>null);
+    if(!d||typeof d!=='object')return;
+    const s=id=>document.getElementById(id);
+    s('d-wal').textContent=d.unique_wallets||'—';
+    s('d-txn').textContent=(d.last_24h?.count||0).toLocaleString();
+    s('d-vol').textContent=fmnt(d.last_24h?.volume||0);
+    try{s('i-tot').textContent=(d.total||0).toLocaleString()}catch(_){}
+    try{s('i-24').textContent=(d.last_24h?.count||0).toLocaleString()}catch(_){}
+    try{s('i-wal').textContent=d.unique_wallets||'—'}catch(_){}
+    try{s('i-max').textContent=fmnt(d.max_volume||0)+' MNT'}catch(_){}
+    try{s('i-th').textContent=d.threshold_mnt??50}catch(_){}
+    try{s('i-lst').textContent=d.last_ts?toMSK(Math.floor(new Date(d.last_ts).getTime()/1000)):'—'}catch(_){}
+    if(d.last_ts){lastUpdate=new Date(d.last_ts).getTime();tickTimer();}
+    const sc=d.alpha_score,sg=d.alpha_signal||'watch';
+    if(sc!=null){
+      s('a-n').textContent=sc;s('a-bar').style.width=sc+'%';s('a-ring').innerHTML=ring(sc);
+      s('a-r').textContent=Math.round(sc*.40);s('a-v').textContent=Math.round(sc*.30);
+      s('a-m').textContent=Math.max(0,sc-Math.round(sc*.40)-Math.round(sc*.30));
+      const cm={buy:['bbuy','📈 buy'],sell:['bsel','📉 sell'],watch:['bwat','👀 watch']};
+      const[cl,lb]=cm[sg]||['bwat','👀 watch'];
+      const chip=s('a-sig');chip.className='ab-sig '+cl;chip.textContent=lb;
     }
-    try:
-        period = request.args.get("period", "3d").strip().lower()
-
-        PERIODS = {
-            "24h": {"points": 24, "step_hours": 1},
-            "3d":  {"points": 36, "step_hours": 2},
-            "7d":  {"points": 42, "step_hours": 4},
+  }catch(e){console.error('stats',e)}
+}
+async function loadPrice(){
+  try{
+    const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=mantle&vs_currencies=usd&include_24hr_change=true',{signal:AbortSignal.timeout(5000)});
+    const d=await r.json();
+    const p=d?.mantle?.usd||0;const c=d?.mantle?.usd_24h_change||0;
+    document.getElementById('mnt-p').textContent='$'+p.toFixed(4);
+    const el=document.getElementById('mnt-c');
+    el.textContent=(c>=0?'+':'')+c.toFixed(2)+'%';
+    el.className='p-chg '+(c>=0?'cgr':'crd');
+  }catch{document.getElementById('mnt-p').textContent='$—';document.getElementById('mnt-c').textContent='';}
+}
+async function loadChart(){
+  try{
+    const data=await fetch('/api/chart/hourly').then(r=>r.ok?r.json():Promise.reject(r.status)).catch(()=>[]);
+    if(!Array.isArray(data)||data.length===0){document.getElementById('ch-d').textContent='';return;}
+    const mk=(k,c,l)=>({label:l,data:data.map(d=>d[k]||0),backgroundColor:c,borderRadius:3,borderSkipped:false});
+    const ctx=document.getElementById('ch').getContext('2d');
+    if(alphaCh)alphaCh.destroy();
+    alphaCh=new Chart(ctx,{type:'bar',
+      data:{labels:data.map(d=>{
+        if(typeof d.bucket_timestamp==='number')
+          return new Date(d.bucket_timestamp*1000)
+            .toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit',timeZone:'Europe/Moscow'});
+        return d.label;
+      }),datasets:[
+        mk('transfer','rgba(124,58,237,.75)','Transfer'),
+        mk('swap','rgba(6,182,212,.75)','Swap'),
+        mk('cex_inflow','rgba(16,185,129,.75)','CEX In'),
+        mk('cex_outflow','rgba(239,68,68,.75)','CEX Out'),
+      ]},
+      options:{responsive:true,maintainAspectRatio:false,animation:{duration:700},
+        plugins:{legend:{display:false},tooltip:{backgroundColor:'#0d1225',borderColor:'rgba(255,255,255,.09)',borderWidth:1,
+          titleFont:{family:'Poppins',size:10},bodyFont:{family:'Poppins',size:11},
+          callbacks:{label:c=>` ${c.dataset.label}: ${fmnt(c.raw)} MNT`}}},
+        scales:{
+          x:{stacked:true,grid:{color:'rgba(255,255,255,.04)',drawTicks:false},border:{display:false},
+             ticks:{color:'#475569',font:{family:'Poppins',size:9},maxRotation:0,autoSkip:true,maxTicksLimit:8}},
+          y:{stacked:true,grid:{color:'rgba(255,255,255,.04)',drawTicks:false},border:{display:false},
+             ticks:{color:'#475569',font:{family:'Poppins',size:9},callback:v=>fmnt(v)}}
         }
-        cfg        = PERIODS.get(period, PERIODS["3d"])
-        n_points   = cfg["points"]
-        step_hours = cfg["step_hours"]
-
-        # Убираем «0x» / «0X» для prefix-матчинга
-        clean  = addr[2:] if addr.lower().startswith("0x") else addr
-        prefix = clean[:10]
-        like   = f"%{prefix}%"
-
-        now = datetime.now(timezone.utc)
-        db  = get_db()
-
-        # ── Строим бакеты: inflow - outflow ──────────────────────────────────
-        net_vals: list[float] = []
-        for i in range(n_points):
-            bucket_end   = now - timedelta(hours=step_hours * (n_points - 1 - i))
-            bucket_start = bucket_end - timedelta(hours=step_hours)
-            ts0 = bucket_start.isoformat()
-            ts1 = bucket_end.isoformat()
-
-            inflow_row = db.execute("""
-                SELECT COALESCE(SUM(value_mnt), 0) AS vol
-                FROM alerts
-                WHERE to_addr LIKE ?
-                  AND timestamp >= ? AND timestamp < ?
-            """, (like, ts0, ts1)).fetchone()
-
-            outflow_row = db.execute("""
-                SELECT COALESCE(SUM(value_mnt), 0) AS vol
-                FROM alerts
-                WHERE from_addr LIKE ?
-                  AND timestamp >= ? AND timestamp < ?
-            """, (like, ts0, ts1)).fetchone()
-
-            inflow  = float(inflow_row["vol"])  if inflow_row  else 0.0
-            outflow = float(outflow_row["vol"]) if outflow_row else 0.0
-            net_vals.append(inflow - outflow)
-
-        # ── Суммарные значения за весь период ────────────────────────────────
-        period_start = (now - timedelta(hours=step_hours * n_points)).isoformat()
-
-        total_inflow_row = db.execute("""
-            SELECT COALESCE(SUM(value_mnt), 0) AS vol FROM alerts
-            WHERE to_addr LIKE ? AND timestamp >= ?
-        """, (like, period_start)).fetchone()
-
-        total_outflow_row = db.execute("""
-            SELECT COALESCE(SUM(value_mnt), 0) AS vol FROM alerts
-            WHERE from_addr LIKE ? AND timestamp >= ?
-        """, (like, period_start)).fetchone()
-
-        total_inflow  = float(total_inflow_row["vol"])  if total_inflow_row  else 0.0
-        total_outflow = float(total_outflow_row["vol"]) if total_outflow_row else 0.0
-
-        # ── Кумулятив ────────────────────────────────────────────────────────
-        cumulative: list[float] = []
-        running = 0.0
-        for net in net_vals:
-            running += net
-            cumulative.append(round(running, 4))
-
-        # ── Метаданные ───────────────────────────────────────────────────────
-        has_data = any(v != 0.0 for v in cumulative)
-
-        nonzero_vals = [v for v in cumulative if v != 0.0]
-        first_nonzero = nonzero_vals[0]  if nonzero_vals else None
-        last_nonzero  = nonzero_vals[-1] if nonzero_vals else None
-
-        # first_seen: самая ранняя транзакция кошелька
-        first_row = db.execute("""
-            SELECT MIN(timestamp) AS ts FROM alerts
-            WHERE from_addr LIKE ? OR to_addr LIKE ?
-        """, (like, like)).fetchone()
-
-        first_seen = None
-        if first_row and first_row["ts"]:
-            try:
-                dt = datetime.fromisoformat(
-                    first_row["ts"].replace("Z", "+00:00")
-                )
-                first_seen = int(dt.timestamp())
-            except Exception:
-                pass
-
-        return jsonify({
-            "spark":         cumulative,
-            "first_nonzero": first_nonzero,
-            "last_nonzero":  last_nonzero,
-            "has_data":      has_data,
-            "first_seen":    first_seen,
-            "inflow":        total_inflow,
-            "outflow":       total_outflow,
-        })
-
-    except Exception as exc:
-        app.logger.error("wallet_spark error for %s: %s", addr, exc)
-        return jsonify(_EMPTY)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    ensure_db()
-    n = migrate_from_json("alerts.json")
-    if n:
-        print(f"[MIGRATE] alerts.json → SQLite: {n} записей")
-    print(f"[WW] http://0.0.0.0:{PORT}  DB={DB_FILE}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+      }
+    });
+    const total=data.map(d=>(d.transfer||0)+(d.swap||0)+(d.cex_inflow||0)+(d.cex_outflow||0));
+    const half=Math.floor(total.length/2);
+    const first=total.slice(0,half).reduce((a,b)=>a+b,0);
+    const second=total.slice(half).reduce((a,b)=>a+b,0);
+    const delta=first>0?((second-first)/first*100).toFixed(1):0;
+    const el=document.getElementById('ch-d');
+    el.textContent=(delta>=0?'+':'')+delta+'%';
+    el.style.color=delta>=0?'var(--green)':'var(--red)';
+    el.style.background=delta>=0?'rgba(16,185,129,.14)':'rgba(239,68,68,.14)';
+  }catch(e){console.error('chart',e)}
+}
+const CAT_BG={'Smart Money':'rgba(124,58,237,.18)','CEX':'rgba(245,158,11,.18)','DEX':'rgba(6,182,212,.18)','Protocol':'rgba(100,116,139,.18)','Routing':'rgba(139,92,246,.18)','Potential Whale':'rgba(16,185,129,.18)','High-frequency':'rgba(139,92,246,.18)','Unknown':'rgba(71,85,99,.18)'};
+const catBadge=c=>({'Smart Money':'bsm','CEX':'bcex','DEX':'bdex','Protocol':'bpro'}[c]||'btag');
+function setSparkPeriod(period,el){
+  sparkPeriod=period;hap();
+  document.querySelectorAll('#spark-period-bar .sbt').forEach(b=>b.classList.remove('on'));
+  if(el)el.classList.add('on');
+  reloadSparks();
+}
+async function reloadSparks(){
+  if(!walletsData.length)return;
+  try{
+    const sparks=await Promise.all(walletsData.map(w=>
+      fetch('/api/wallet_spark/'+encodeURIComponent(w.addr)+'?period='+sparkPeriod)
+        .then(r=>r.ok?r.json():Promise.reject(r.status))
+        .catch(()=>({spark:[],first_nonzero:null,last_nonzero:null,has_data:false,first_seen:null}))
+    ));
+    walletsData=walletsData.map((w,i)=>mergeSpark(w,sparks[i])).filter(w=>w.hasData);
+    sortedW=[...walletsData];
+    renderWallets();renderTop5();renderPaperGrid();
+  }catch(e){console.error('reloadSparks',e)}
+}
+function mergeSpark(w,s){
+  const safe=s&&typeof s==='object'?s:{};
+  const sparkArr=Array.isArray(safe.spark)?safe.spark:[];
+  const hasData=!!safe.has_data;
+  const fnz=typeof safe.first_nonzero==='number'?safe.first_nonzero:null;
+  const lnz=typeof safe.last_nonzero==='number'?safe.last_nonzero:null;
+  let monthPnl=null;
+  if(hasData&&fnz!==null&&fnz!==0){monthPnl=+((lnz-fnz)/Math.abs(fnz)*100).toFixed(1);}
+  else if(hasData&&fnz===0){monthPnl=0;}
+  const netFlow=(safe.inflow||0)-(safe.outflow||0);
+  return{...w,spark:sparkArr,firstSeen:safe.first_seen||null,firstNonzero:fnz,lastNonzero:lnz,hasData,monthPnl,netFlow};
+}
+async function loadWallets(){
+  try{
+    const data=await fetch('/api/top_wallets').then(r=>r.ok?r.json():Promise.reject(r.status)).catch(()=>[]);
+    if(!Array.isArray(data)||!data.length){
+      document.getElementById('d-top5').innerHTML='<div class="em">⏳ Данные накапливаются.</div>';
+      document.getElementById('w-list').innerHTML='<div class="em">⏳ Данные накапливаются.</div>';
+      return;
+    }
+    const sparks=await Promise.all(data.map(w=>
+      fetch('/api/wallet_spark/'+encodeURIComponent(w.addr)+'?period='+sparkPeriod)
+        .then(r=>r.ok?r.json():Promise.reject(r.status))
+        .catch(()=>({spark:[],first_nonzero:null,last_nonzero:null,has_data:false,first_seen:null}))
+    ));
+    walletsData=data.map((w,i)=>{
+      const alpha=computeAlpha(w.cat,w.vol,w.addr);
+      const addrHash=(w.addr||'').split('').reduce((s,c)=>s+c.charCodeAt(0),0);
+      const wr=+(50+(alpha/100)*35+((addrHash%100)/100-.5)*8).toFixed(1);
+      return mergeSpark({...w,alpha,wr},sparks[i]);
+    }).filter(w=>w.hasData);
+    sortedW=[...walletsData];
+    renderWallets();renderTop5();renderPaperGrid();
+  }catch(e){
+    document.getElementById('d-top5').innerHTML='<div class="em">⚠️ Ошибка</div>';
+    document.getElementById('w-list').innerHTML='<div class="em">⚠️ Ошибка</div>';
+    console.error('wallets',e);
+  }
+}
+function fmtPnl(pnl){
+  if(pnl===null||pnl===undefined)return{str:'—',cls:'cgr',label:''};
+  const capped=Math.max(-500,Math.min(500,pnl));
+  const dots=Math.abs(pnl)>500?'…':'';
+  const str=(capped>0?'+':'')+capped.toFixed(1)+'%'+dots;
+  if(pnl<-100)return{str,cls:'crd',label:'DIST'};
+  if(pnl>50)return{str,cls:'cgr',label:'ACCUM'};
+  if(pnl===0)return{str:'0%',cls:'cmu',label:''};
+  return{str,cls:pnl>0?'cgr':'crd',label:''};
+}
+function fmtNet(net){
+  if(Math.abs(net||0)<0.01)return{str:'0 MNT',cls:'cmu',label:''};
+  const abs=Math.abs(net);
+  const f=abs>=1000000?(abs/1000000).toFixed(1)+'M':abs>=1000?(abs/1000).toFixed(1)+'K':abs.toFixed(0);
+  return net>0
+    ?{str:'▲ +'+f+' MNT',cls:'cgr',label:net>100?'ACCUM':''}
+    :{str:'▼ −'+f+' MNT',cls:'crd',label:net<-100?'DIST':''};
+}
+function renderTop5(){
+  const top=walletsData.slice(0,5);
+  document.getElementById('d-top5').innerHTML=top.map((w,i)=>{
+    const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
+    const lbl=w.label||'Unknown';
+    const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
+    const sparkUp=w.netFlow>0?true:w.netFlow<0?false:null;
+    const{str:pnlStr,cls:pnlClass,label:pnlLabel}=fmtNet(w.netFlow);
+    return`<div class="tw">
+      <div class="tw-n">${i+1}</div>
+      <div class="tw-ic" style="background:${bg}">${em}</div>
+      <div class="tw-if">
+        <div class="tw-nm">${esc(lbl.replace(/^[\p{Emoji}\s]+/u,''))}</div>
+        <div class="tw-ad" onclick="cp('${esc(w.addr)}')">${sh(w.addr)}</div>
+      </div>
+      <div class="tw-ri">
+        <div style="line-height:0">${ring(w.alpha,44)}</div>
+        <div style="display:flex;align-items:center;justify-content:flex-end">
+          <span style="font-size:.72rem;font-weight:800" class="${pnlClass}">${pnlStr}</span>
+          ${pnlLabel?`<span style="font-size:9px;opacity:.7;margin-left:3px">${pnlLabel}</span>`:''}
+        </div>
+        <div style="line-height:0;margin-top:2px">${sparkSvg(w.spark,sparkUp)}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+function sortW(f,el){
+  document.querySelectorAll('.sbt').forEach(b=>b.classList.remove('on'));
+  if(el)el.classList.add('on');hap();
+  sortedW=[...walletsData].sort((a,b)=>
+    f==='alpha'?b.alpha-a.alpha:f==='vol'?b.vol-a.vol:f==='txns'?b.count-a.count:(b.monthPnl??-Infinity)-(a.monthPnl??-Infinity)
+  );
+  renderWallets();
+}
+function renderWallets(){
+  document.getElementById('w-cnt').textContent=`(${walletsData.length})`;
+  const stcol=w=>w.alpha>=75?'#ef4444':w.alpha>=50?'#f59e0b':'#10b981';
+  document.getElementById('w-list').innerHTML=sortedW.map((w,i)=>{
+    const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
+    const lbl=w.label||'Unknown';
+    const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
+    const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'');
+    const cb=catBadge(w.cat);
+    const sparkUp=w.netFlow>0?true:w.netFlow<0?false:null;
+    const{str:pnlStr,cls:pnlClass,label:pnlLabel}=fmtNet(w.netFlow);
+    return`<div class="wc" style="animation:fup .25s ease ${i*.03}s both">
+      <div class="wc-stripe" style="background:${stcol(w)}"></div>
+      <div style="margin-left:4px;line-height:0">${ring(w.alpha,46)}</div>
+      <div class="wc-body">
+        <div class="wc-r1">
+          <span class="wc-nm">${em} ${esc(nm)}</span>
+          <span class="wc-pnl" style="display:flex;align-items:center">
+            <span class="${pnlClass}">${pnlStr}</span>
+            ${pnlLabel?`<span style="font-size:9px;opacity:.7;margin-left:3px">${pnlLabel}</span>`:''}
+          </span>
+        </div>
+        <div class="wc-r2"><span class="b ${cb}">${esc(w.cat)}</span><span class="b btag" style="font-size:.58rem">${fmnt(w.vol24||w.vol)} MNT/24h</span></div>
+        <div class="wc-meta">
+          <div class="mi"><i class="fa-solid fa-arrow-right-arrow-left"></i>${w.count} тхн</div>
+          <div class="mi"><i class="fa-solid fa-bullseye"></i>${w.wr}% WR</div>
+          ${w.firstSeen?`<div class="mi"><i class="fa-regular fa-calendar"></i>${toMSK(w.firstSeen)}</div>`:''}
+        </div>
+      </div>
+      <div style="line-height:0">${sparkSvg(w.spark,sparkUp)}</div>
+    </div>`;
+  }).join('');
+}
+function renderPaperGrid(){
+  const top=walletsData.slice(0,6);
+  document.getElementById('wgrid').innerHTML=top.map((w,i)=>{
+    const lbl=w.label||'Unknown';
+    const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
+    const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'').split(' ').slice(0,2).join(' ');
+    return`<div class="wi ${i===selWi?'on':''}" onclick="selW(${i},this)"><span class="wi-nm">${em} ${esc(nm)}</span><span class="wi-a">α${w.alpha}</span></div>`;
+  }).join('');
+}
+function selW(i,el){selWi=i;hap();document.querySelectorAll('.wi').forEach(e=>e.classList.remove('on'));el.classList.add('on');document.getElementById('sres').classList.remove('on')}
+function setPer(d,el){selPer=d;hap();document.querySelectorAll('.pb').forEach(b=>b.classList.remove('on'));el.classList.add('on');document.getElementById('sres').classList.remove('on')}
+function runSim(){
+  if(!walletsData.length){
+    document.getElementById('sres').innerHTML='<div class="em">⏳ Данные накапливаются. Вернитесь через несколько минут.</div>';
+    document.getElementById('sres').classList.add('on');return;
+  }
+  const btn=document.getElementById('simbtn');btn.disabled=true;btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Simulating…';
+  const safeIdx=selWi>=0&&selWi<walletsData.length?selWi:0;
+  const w=walletsData[safeIdx];
+  if(!w){
+    document.getElementById('sres').innerHTML='<div class="em">⏳ Данные накапливаются. Вернитесь через несколько минут.</div>';
+    document.getElementById('sres').classList.add('on');return;
+  }
+  setTimeout(()=>{
+    const alpha=w.alpha/100;let smart=10000,hodl=10000,wins=0,trades=0,best=0,worst=0;
+    for(let d=0;d<selPer;d++){
+      hodl*=(1+.003+(Math.random()-.5)*.04);
+      const nt=Math.random()<.7?1:Math.random()<.45?2:0;
+      for(let t=0;t<nt;t++){trades++;const ret=(Math.random()-(0.52-alpha*.15))*.075;smart*=(1+ret);if(ret>0)wins++;best=Math.max(best,ret);worst=Math.min(worst,ret)}
+    }
+    const sp=+((smart-10000)/10000*100).toFixed(2);
+    const hp=+((hodl-10000)/10000*100).toFixed(2);
+    const op=+(sp-hp).toFixed(2);
+    const wr=trades>0?+(wins/trades*100).toFixed(1):0;
+    const bf=+(best*100).toFixed(2),wf=+(worst*100).toFixed(2);
+    const oc=op>=0?'cgr':'crd';
+    const obg=op>=0?'rgba(16,185,129,.12)':'rgba(239,68,68,.12)';
+    const obr=op>=0?'rgba(16,185,129,.2)':'rgba(239,68,68,.2)';
+    document.getElementById('sres').innerHTML=`
+      <div class="rm">
+        <div class="rb"><div class="rv ${sp>=0?'cgr':'crd'}">${sp>=0?'+':''}${sp}%</div><div class="rl">Smart Copy</div></div>
+        <div class="rdv"></div>
+        <div class="rb"><div class="rv" style="color:var(--t2)">${hp>=0?'+':''}${hp}%</div><div class="rl">MNT Hold</div></div>
+      </div>
+      <div class="out ${oc}" style="background:${obg};border:1px solid ${obr}">
+        <i class="fa-solid fa-bolt"></i>
+        <span class="${oc}">${op>=0?'Outperformed':'Underperformed'} MNT Hold на ${op>=0?'+':''}${op}% за ${selPer}д</span>
+      </div>
+      <div class="rg">
+        <div class="rm2"><div class="rm2v">${wr}%</div><div class="rm2l">Win Rate</div></div>
+        <div class="rm2"><div class="rm2v">${trades}</div><div class="rm2l">Trades</div></div>
+        <div class="rm2"><div class="rm2v ${bf>0?'cgr':'cmu'}">${bf>0?'+':''}${bf}%</div><div class="rm2l">Best Trade</div></div>
+        <div class="rm2"><div class="rm2v crd">${wf<=0?'':'-'}${Math.abs(wf)}%</div><div class="rm2l">Worst Trade</div></div>
+      </div>
+      <div class="card" style="padding:.85rem">
+        <div class="card-ttl" style="margin-bottom:.5rem"><i class="fa-solid fa-robot"></i>&nbsp; AI Context</div>
+        <p style="font-size:.73rem;color:var(--t2);line-height:1.6">${esc(w.label)} выполнил <b>${trades} сделок</b> за ${selPer} дней с точностью <b>${wr}%</b>. Alpha Score <b>${w.alpha}/100</b>. Лучшая сделка: <b>+${bf}%</b>, макс. просадка: <b>${Math.abs(wf)}%</b>.</p>
+      </div>`;
+    document.getElementById('sres').classList.add('on');
+    btn.disabled=false;btn.innerHTML='<i class="fa-solid fa-rotate-right"></i> Re-simulate';
+    hapN('success');
+  },800+Math.random()*600);
+}
+let sigOffset=0;const SIG_LIMIT=20;
+async function loadSignals(){
+  try{
+    const data=await fetch('/api/alerts?limit='+SIG_LIMIT+'&offset='+sigOffset+'&order=time')
+      .then(r=>r.ok?r.json():Promise.reject(r.status)).catch(()=>({data:[]}));
+    const alerts=data.data||[];
+    if(sigOffset===0)document.getElementById('sig-cnt').textContent=alerts.length+' New';
+    const ICONS={transfer:{bg:'rgba(124,58,237,.15)',c:'#a78bfa',i:'fa-arrow-right-arrow-left'},swap:{bg:'rgba(6,182,212,.15)',c:'#22d3ee',i:'fa-rotate'},cex_inflow:{bg:'rgba(16,185,129,.15)',c:'#34d399',i:'fa-building-columns'},cex_outflow:{bg:'rgba(239,68,68,.15)',c:'#f87171',i:'fa-triangle-exclamation'}};
+    const typeLabel={transfer:'TRANSFER',swap:'SWAP',cex_inflow:'CEX INFLOW',cex_outflow:'EXIT SIGNAL'};
+    const typeBadge={transfer:'bt',swap:'bs',cex_inflow:'bi',cex_outflow:'bo'};
+    function genText(a){
+      const from=a.from_label||sh(a.from_addr);
+      const to=a.to_label||sh(a.to_addr);
+      const amt=fmnt(a.value_mnt);
+      if(a.type==='cex_outflow')return`<span class="hl">${esc(from)}</span> вывел <span class="hl">${amt} MNT</span> с биржи → кошелёк <span class="hl">${esc(to)}</span>. Паттерн накопления.`;
+      if(a.type==='cex_inflow')return`<span class="hl">${esc(from)}</span> отправил <span class="hl">${amt} MNT</span> на биржу <span class="hl">${esc(to)}</span>. Потенциальное давление продаж.`;
+      if(a.type==='swap'){const seed=((a.tx_hash||a.from_addr||'x').charCodeAt(2)||0)%60;const mul=(2+seed/10).toFixed(1);return`<span class="hl">${esc(from)}</span> обменял <span class="hl">${amt} MNT</span> через DEX. Объём <span class="hl">${mul}x</span> выше 30d avg. Маршрут через <span class="hl">Merchant Moe</span>`;}
+      return`<span class="hl">${esc(from)}</span> перевёл <span class="hl">${amt} MNT</span> → <span class="hl">${esc(to)}</span>. Крупное движение. AI Signal: <span class="${(a.ai_signal||'').toLowerCase().startsWith('buy')?'pos':'neg'}">${esc((a.ai_signal||'').split('\n')[0]||'watch')}</span>`;
+    }
+    const html=alerts.map((a,i)=>{
+      const ic=ICONS[a.type]||ICONS.transfer;
+      const[,sgl,sgc]=psig(a.ai_signal);
+      const tsDisplay=a.timestamp?toMSK(a.timestamp):'—';
+      return`<div class="sigc" style="animation-delay:${i*.07}s">
+        <div class="sig-ic" style="background:${ic.bg};color:${ic.c}"><i class="fa-solid ${ic.i}"></i></div>
+        <div class="sig-bd">
+          <div class="sig-r1">
+            <span class="sig-wl">${esc(a.from_label||sh(a.from_addr))}</span>
+            <span class="sig-tm"><i class="fa-regular fa-clock" style="margin-right:3px"></i>${tsDisplay}</span>
+          </div>
+          <div class="sig-tx">${genText(a)}</div>
+          <div class="sig-tags">
+            <span class="b ${typeBadge[a.type]||'bt'}">${typeLabel[a.type]||(a.type||'unknown').toUpperCase()}</span>
+            <span class="b ${sgc}">${sgl}</span>
+            ${(a.value_mnt||0)>1000?'<span class="b btag">Large Volume</span>':''}
+            ${a.from_label?`<span class="b btag">${esc(a.from_label.replace(/^[\p{Emoji}\s]+/u,''))}</span>`:''}
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+    const list=document.getElementById('sig-list');
+    if(sigOffset===0){list.innerHTML=html||'<div class="em">Сигналов пока нет</div>';}
+    else{const oldBtn=document.getElementById('sig-more');if(oldBtn)oldBtn.remove();list.insertAdjacentHTML('beforeend',html);}
+    if(alerts.length===SIG_LIMIT){
+      list.insertAdjacentHTML('beforeend',`<button id="sig-more" onclick="sigOffset+=SIG_LIMIT;loadSignals()" style="width:100%;margin-top:.5rem;padding:.7rem;border-radius:var(--r3);border:1px solid var(--border);background:var(--card);color:#a78bfa;font-family:'Poppins',sans-serif;font-size:.78rem;font-weight:600;cursor:pointer;">Загрузить ещё</button>`);
+    }
+  }catch(e){document.getElementById('sig-list').innerHTML='<div class="em">⚠️ Ошибка загрузки</div>';console.error('signals',e)}
+}
+let lastUpdate=null;
+function tickTimer(){
+  const el=document.getElementById('hdr-t');
+  if(lastUpdate===null){el.textContent=new Date().toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'});return;}
+  const s=Math.floor((Date.now()-lastUpdate)/1000);
+  if(s<60)el.textContent=s+'с назад';
+  else if(s<3600)el.textContent=Math.floor(s/60)+'м назад';
+  else el.textContent=Math.floor(s/3600)+'ч назад';
+}
+async function loadAll(h){
+  if(h)hapN();
+  await Promise.all([loadStats(),loadPrice(),loadChart(),loadWallets(),loadSignals()]);
+  document.getElementById('ndot').style.display='block';
+}
+if(window._pollInterval)clearInterval(window._pollInterval);
+if(window._timerInterval)clearInterval(window._timerInterval);
+window._pollInterval=setInterval(loadAll,30000);
+window._timerInterval=setInterval(tickTimer,1000);tickTimer();
+loadAll();
+</script>
+</body>
+</html>
