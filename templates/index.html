@@ -60,7 +60,7 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
 .nb span{font-size:.6rem;font-weight:600;color:var(--t3);letter-spacing:.2px}
 .nb.on i,.nb.on span{color:#a78bfa}
 .nb.on i{filter:drop-shadow(0 0 6px rgba(167,139,250,.6))}
-.nb.on::after{content:'';position:absolute;bottom:4px;width:4px;height:4px;border-radius:50%;background:#a78bfa}
+.nb.on::after{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:24px;height:2px;background:#a78bfa;border-radius:2px;bottom:auto}
 .nb-dot{position:absolute;top:6px;right:calc(50% - 14px);width:7px;height:7px;border-radius:50%;background:var(--red);border:2px solid var(--bg)}
 
 /* CARD */
@@ -295,7 +295,7 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
     </div>
 
     <div class="card">
-      <div class="shdr" style="margin-bottom:.5rem"><div class="sttl">Top Smart Wallets</div><div class="sact" onclick="go('s3')">View all →</div></div>
+      <div class="shdr" style="margin-bottom:.5rem"><div class="sttl">Top Smart Wallets</div><div class="sact" onclick="go('s2')">View all →</div></div>
       <div id="d-top5"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
     </div>
   </div>
@@ -636,7 +636,8 @@ function fmtPnl(pnl){
   const str = (capped>0?'+':'')+capped.toFixed(1)+'%'+dots;
   if(pnl < -100) return {str, cls:'crd', label:'DIST'};
   if(pnl > 50)  return {str, cls:'cgr', label:'ACCUM'};
-  return {str, cls: pnl>=0?'cgr':'crd', label:''};
+  if(pnl===0) return {str:'0%', cls:'cmu', label:''};
+  return {str, cls: pnl>0?'cgr':'crd', label:''};
 }
 
 function renderTop5(){
