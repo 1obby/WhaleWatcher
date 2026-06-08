@@ -411,9 +411,15 @@ function computeAlpha(cat,vol24){
   const mkt=Math.floor(8+Math.random()*14);
   return Math.min(99,rep+vs+mkt);
 }
-function genSpark7(alpha){
-  const trend=(alpha-50)/200; let v=50+Math.random()*20;
-  return Array.from({length:7},()=>{v+=(Math.random()-.47+trend)*8;return Math.max(15,Math.min(95,v))});
+function genSpark7(alpha,addr){
+  const trend=(alpha-50)/200;
+  const a=addr||'';
+  let v=50+((a.charCodeAt(0)||0)%20);
+  return Array.from({length:7},(_,i)=>{
+    const seed=((a.charCodeAt(i%Math.max(a.length,1))||0)+i*7)%100/100-.5;
+    v+=(seed*0.6-.47+trend)*8;
+    return Math.max(15,Math.min(95,v));
+  });
 }
 
 /* ── STATE ── */
@@ -526,7 +532,7 @@ async function loadWallets(){
       const alpha=computeAlpha(w.cat,w.vol);
       const monthPnl = +((alpha/100)*50-10+(w.vol%100)/100*10-5).toFixed(1);
       const wr=+(50+(alpha/100)*35+(Math.random()-.5)*8).toFixed(1);
-      return{...w,alpha,monthPnl,wr,spark:genSpark7(alpha)};
+      return{...w,alpha,monthPnl,wr,spark:genSpark7(alpha,w.addr)};
     });
     sortedW=[...walletsData];
     renderWallets();
@@ -555,6 +561,7 @@ function renderTop5(){
       <div class="tw-ri">
         <div style="line-height:0">${ring(w.alpha,44)}</div>
         <span style="font-size:.72rem;font-weight:800;${w.monthPnl>=0?'color:var(--green)':'color:var(--red)'}">${w.monthPnl>=0?'+':''}${w.monthPnl}%</span>
+        <div style="line-height:0;margin-top:2px">${spark(w.spark)}</div>
       </div>
     </div>`;
   }).join('');
