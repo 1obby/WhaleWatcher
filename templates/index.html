@@ -303,6 +303,12 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
   <!-- WALLETS -->
   <div class="sc" id="s2">
     <div class="shdr"><div class="sttl">Smart Wallets <span style="color:var(--t3);font-weight:400" id="w-cnt"></span></div><span class="b bsm"><i class="fa-solid fa-network-wired"></i>&nbsp;Mantle</span></div>
+    <!-- Spark period selector -->
+    <div class="sb" id="spark-period-bar" style="margin-bottom:.45rem">
+      <button class="sbt" onclick="setSparkPeriod('24h',this)">24ч</button>
+      <button class="sbt on" id="sp-btn-3d" onclick="setSparkPeriod('3d',this)">3д</button>
+      <button class="sbt" onclick="setSparkPeriod('7d',this)">7д</button>
+    </div>
     <div class="sb" id="sort-bar">
       <button class="sbt on" onclick="sortW('alpha',this)">Alpha ↓</button>
       <button class="sbt" onclick="sortW('vol',this)">Объём</button>
@@ -388,12 +394,15 @@ function ring(s,sz=66){
 }
 
 /* ── SPARKLINE SVG ── */
-function spark(data,up,w=76,h=26){
-  if(!data||data.length===0)return`<svg width="${w}" height="${h}"></svg>`;
-  if(data.length===1)data=[data[0],data[0]];
-  const mn=Math.min(...data),mx=Math.max(...data),rng=mx-mn||1;
-  const pts=data.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-mn)/rng)*(h-2)-1}`).join(' ');
-  const col=up?'#10b981':'#ef4444';
+// sparkUp: true=green, false=red, null=grey (no data)
+function sparkSvg(data,sparkUp,w=76,h=26){
+  if(!data||data.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
+  const filtered=data.filter(v=>typeof v==='number'&&isFinite(v));
+  if(filtered.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
+  const d2=filtered.length===1?[filtered[0],filtered[0]]:filtered;
+  const mn=Math.min(...d2),mx=Math.max(...d2),rng=mx-mn||1;
+  const pts=d2.map((v,i)=>`${(i/(d2.length-1))*w},${h-((v-mn)/rng)*(h-2)-1}`).join(' ');
+  const col=sparkUp===null?'#555':sparkUp?'#00ff88':'#ff4466';
   return`<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg">
     <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.8"
       stroke-linejoin="round" stroke-linecap="round"/>
@@ -412,22 +421,28 @@ function computeAlpha(cat,vol24,addr){
   const mkt=8+(h%14);
   return Math.min(99,rep+vs+mkt);
 }
-function genSpark(addr){
-  const a=addr||'x';
-  return Array.from({length:30},(_,i)=>{
-    const seed=(a.charCodeAt(i%a.length)*31+i*17)%200/100-1;
-    return seed*2;
-  });
+
+/* ── MOSCOW TIME HELPER ── */
+function toMSK(ts){
+  if(!ts)return'—';
+  try{
+    const unix=typeof ts==='number'?ts:Math.floor(new Date(ts).getTime()/1000);
+    const d=new Date((unix+3*3600)*1000);
+    return d.toLocaleString('ru-RU',{timeZone:'UTC',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' МСК';
+  }catch{return'—'}
 }
 
 /* ── STATE ── */
 let walletsData=[],sortedW=[],selPer=7,selWi=0,alphaCh=null;
+let sparkPeriod='3d';
 const rnd=(mn,mx)=>mn+(Math.random()*(mx-mn));
 
 /* ── STATS ── */
 async function loadStats(){
   try{
-    const d=await(await fetch('/api/stats')).json();
+    const d=await fetch('/api/stats')
+      .then(r=>r.ok?r.json():Promise.reject(r.status))
+      .catch(()=>null);
     if(!d||typeof d!=='object')return;
     const s=id=>document.getElementById(id);
     s('d-wal').textContent=d.unique_wallets||'—';
@@ -439,7 +454,7 @@ async function loadStats(){
     try{s('i-wal').textContent=d.unique_wallets||'—'}catch(_){}
     try{s('i-max').textContent=fmnt(d.max_volume||0)+' MNT'}catch(_){}
     try{s('i-th').textContent=d.threshold_mnt??50}catch(_){}
-    try{s('i-lst').textContent=d.last_ts?fdt(d.last_ts):'—'}catch(_){}
+    try{s('i-lst').textContent=d.last_ts?toMSK(Math.floor(new Date(d.last_ts).getTime()/1000)):'—'}catch(_){}
     if(d.last_ts){lastUpdate=new Date(d.last_ts).getTime();tickTimer();}
     const sc=d.alpha_score,sg=d.alpha_signal||'watch';
     if(sc!=null){
@@ -475,7 +490,9 @@ async function loadPrice(){
 /* ── CHART ── */
 async function loadChart(){
   try{
-    const data=await(await fetch('/api/chart/hourly')).json();
+    const data=await fetch('/api/chart/hourly')
+      .then(r=>r.ok?r.json():Promise.reject(r.status))
+      .catch(()=>[]);
     if(!Array.isArray(data)||data.length===0){
       const el=document.getElementById('ch-d');el.textContent='';
       return;
@@ -522,16 +539,66 @@ const CAT_BG={'Smart Money':'rgba(124,58,237,.18)','CEX':'rgba(245,158,11,.18)',
   'High-frequency':'rgba(139,92,246,.18)','Unknown':'rgba(71,85,99,.18)'};
 const catBadge=c=>({'Smart Money':'bsm','CEX':'bcex','DEX':'bdex','Protocol':'bpro'}[c]||'btag');
 
+function setSparkPeriod(period, el){
+  sparkPeriod=period; hap();
+  document.querySelectorAll('#spark-period-bar .sbt').forEach(b=>b.classList.remove('on'));
+  if(el)el.classList.add('on');
+  // Reload all sparks without full wallet reload
+  reloadSparks();
+}
+
+async function reloadSparks(){
+  if(!walletsData.length)return;
+  try{
+    const sparks=await Promise.all(walletsData.map(w=>
+      fetch('/api/wallet_spark/'+encodeURIComponent(w.addr)+'?period='+sparkPeriod)
+        .then(r=>r.ok?r.json():Promise.reject(r.status))
+        .catch(()=>({spark:[],first_seen:null,total_points:0}))
+    ));
+    walletsData=walletsData.map((w,i)=>{
+      const s=sparks[i]||{spark:[],first_seen:null,total_points:0};
+      const sparkArr=Array.isArray(s.spark)?s.spark:[];
+      const nonZero=sparkArr.filter(v=>v>0);
+      const first=nonZero.length>0?nonZero[0]:null;
+      const last=nonZero.length>0?nonZero[nonZero.length-1]:null;
+      const monthPnl=(first!==null&&first>0)? +((last-first)/first*100).toFixed(1):null;
+      return{...w,spark:sparkArr,firstSeen:s.first_seen,totalPoints:s.total_points,monthPnl};
+    });
+    sortedW=[...walletsData];
+    renderWallets();
+    renderTop5();
+    renderPaperGrid();
+  }catch(e){console.error('reloadSparks',e)}
+}
+
 async function loadWallets(){
   try{
-    const data=await(await fetch('/api/top_wallets')).json();
-    // Обогащаем данные
-    walletsData=data.map(w=>{
+    const data=await fetch('/api/top_wallets')
+      .then(r=>r.ok?r.json():Promise.reject(r.status))
+      .catch(()=>[]);
+    if(!Array.isArray(data)||!data.length){
+      document.getElementById('d-top5').innerHTML='<div class="em">⏳ Данные накапливаются.</div>';
+      document.getElementById('w-list').innerHTML='<div class="em">⏳ Данные накапливаются.</div>';
+      return;
+    }
+    // Fetch sparks in parallel
+    const sparks=await Promise.all(data.map(w=>
+      fetch('/api/wallet_spark/'+encodeURIComponent(w.addr)+'?period='+sparkPeriod)
+        .then(r=>r.ok?r.json():Promise.reject(r.status))
+        .catch(()=>({spark:[],first_seen:null,total_points:0}))
+    ));
+    // Merge
+    walletsData=data.map((w,i)=>{
       const alpha=computeAlpha(w.cat,w.vol,w.addr);
-      const monthPnl = +((alpha/100)*50-10+(w.vol%100)/100*10-5).toFixed(1);
+      const s=sparks[i]||{spark:[],first_seen:null,total_points:0};
+      const sparkArr=Array.isArray(s.spark)?s.spark:[];
+      const nonZero=sparkArr.filter(v=>v>0);
+      const first=nonZero.length>0?nonZero[0]:null;
+      const last=nonZero.length>0?nonZero[nonZero.length-1]:null;
+      const monthPnl=(first!==null&&first>0)? +((last-first)/first*100).toFixed(1):null;
       const addrHash=(w.addr||'').split('').reduce((s,c)=>s+c.charCodeAt(0),0);
       const wr=+(50+(alpha/100)*35+((addrHash%100)/100-.5)*8).toFixed(1);
-      return{...w,alpha,monthPnl,wr,spark:genSpark(w.addr)};
+      return{...w,alpha,monthPnl,wr,spark:sparkArr,firstSeen:s.first_seen,totalPoints:s.total_points};
     });
     sortedW=[...walletsData];
     renderWallets();
@@ -550,6 +617,13 @@ function renderTop5(){
     const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
     const lbl=w.label||'Unknown';
     const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
+    // Real spark color based on first vs last non-zero
+    const nonZero=(w.spark||[]).filter(v=>v>0);
+    const spFirst=nonZero.length>0?nonZero[0]:null;
+    const spLast=nonZero.length>0?nonZero[nonZero.length-1]:null;
+    const sparkUp=spFirst!==null&&spLast!==null?spLast>=spFirst:null;
+    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>=0?'+':''}${w.monthPnl}%`:'—';
+    const pnlColor=w.monthPnl===null||w.monthPnl===undefined?'color:var(--t3)':w.monthPnl>=0?'color:var(--green)':'color:var(--red)';
     return`<div class="tw">
       <div class="tw-n">${i+1}</div>
       <div class="tw-ic" style="background:${bg}">${em}</div>
@@ -559,8 +633,8 @@ function renderTop5(){
       </div>
       <div class="tw-ri">
         <div style="line-height:0">${ring(w.alpha,44)}</div>
-        <span style="font-size:.72rem;font-weight:800;${w.monthPnl>=0?'color:var(--green)':'color:var(--red)'}">${w.monthPnl>=0?'+':''}${w.monthPnl}%</span>
-        <div style="line-height:0;margin-top:2px">${spark(w.spark,w.monthPnl>=0)}</div>
+        <span style="font-size:.72rem;font-weight:800;${pnlColor}">${pnlStr}</span>
+        <div style="line-height:0;margin-top:2px">${sparkSvg(w.spark,sparkUp)}</div>
       </div>
     </div>`;
   }).join('');
@@ -569,7 +643,12 @@ function renderTop5(){
 function sortW(f,el){
   document.querySelectorAll('.sbt').forEach(b=>b.classList.remove('on'));
   if(el)el.classList.add('on'); hap();
-  sortedW=[...walletsData].sort((a,b)=>f==='alpha'?b.alpha-a.alpha:f==='vol'?b.vol-a.vol:f==='txns'?b.count-a.count:b.monthPnl-a.monthPnl);
+  sortedW=[...walletsData].sort((a,b)=>
+    f==='alpha'?b.alpha-a.alpha:
+    f==='vol'?b.vol-a.vol:
+    f==='txns'?b.count-a.count:
+    (b.monthPnl??-Infinity)-(a.monthPnl??-Infinity)
+  );
   renderWallets();
 }
 
@@ -582,21 +661,30 @@ function renderWallets(){
     const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
     const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'');
     const cb=catBadge(w.cat);
+    // Real spark color
+    const nonZero=(w.spark||[]).filter(v=>v>0);
+    const spFirst=nonZero.length>0?nonZero[0]:null;
+    const spLast=nonZero.length>0?nonZero[nonZero.length-1]:null;
+    const sparkUp=spFirst!==null&&spLast!==null?spLast>=spFirst:null;
+    const noData=(w.totalPoints||0)<2;
+    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>=0?'+':''}${w.monthPnl}%`:'—';
+    const pnlClass=w.monthPnl===null||w.monthPnl===undefined?'cmu':w.monthPnl>=0?'cgr':'crd';
     return`<div class="wc" style="animation:fup .25s ease ${i*.03}s both">
       <div class="wc-stripe" style="background:${stcol(w)}"></div>
       <div style="margin-left:4px;line-height:0">${ring(w.alpha,46)}</div>
       <div class="wc-body">
         <div class="wc-r1">
           <span class="wc-nm">${em} ${esc(nm)}</span>
-          <span class="wc-pnl ${w.monthPnl>=0?'cgr':'crd'}">${w.monthPnl>=0?'+':''}${w.monthPnl}%</span>
+          <span class="wc-pnl ${pnlClass}">${noData?'нет данных':pnlStr}</span>
         </div>
         <div class="wc-r2"><span class="b ${cb}">${esc(w.cat)}</span><span class="b btag" style="font-size:.58rem">${fmnt(w.vol24||w.vol)} MNT/24h</span></div>
         <div class="wc-meta">
           <div class="mi"><i class="fa-solid fa-arrow-right-arrow-left"></i>${w.count} тхн</div>
           <div class="mi"><i class="fa-solid fa-bullseye"></i>${w.wr}% WR</div>
+          ${w.firstSeen?`<div class="mi"><i class="fa-regular fa-calendar"></i>${toMSK(w.firstSeen)}</div>`:''}
         </div>
       </div>
-      <div style="line-height:0">${spark(w.spark,w.monthPnl>=0)}</div>
+      <div style="line-height:0">${sparkSvg(w.spark,sparkUp)}</div>
     </div>`;
   }).join('');
 }
@@ -674,7 +762,9 @@ function runSim(){
 /* ── SIGNALS (из реальных алертов) ── */
 async function loadSignals(){
   try{
-    const data=await(await fetch('/api/alerts?limit=5&order=time')).json();
+    const data=await fetch('/api/alerts?limit=5&order=time')
+      .then(r=>r.ok?r.json():Promise.reject(r.status))
+      .catch(()=>({data:[]}));
     const alerts=data.data||[];
     document.getElementById('sig-cnt').textContent=alerts.length+' New';
     const ICONS={transfer:{bg:'rgba(124,58,237,.15)',c:'#a78bfa',i:'fa-arrow-right-arrow-left'},swap:{bg:'rgba(6,182,212,.15)',c:'#22d3ee',i:'fa-rotate'},cex_inflow:{bg:'rgba(16,185,129,.15)',c:'#34d399',i:'fa-building-columns'},cex_outflow:{bg:'rgba(239,68,68,.15)',c:'#f87171',i:'fa-triangle-exclamation'}};
@@ -686,19 +776,19 @@ async function loadSignals(){
       const amt=fmnt(a.value_mnt);
       if(a.type==='cex_outflow')return`<span class="hl">${esc(from)}</span> вывел <span class="hl">${amt} MNT</span> с биржи → кошелёк <span class="hl">${esc(to)}</span>. Паттерн накопления.`;
       if(a.type==='cex_inflow')return`<span class="hl">${esc(from)}</span> отправил <span class="hl">${amt} MNT</span> на биржу <span class="hl">${esc(to)}</span>. Потенциальное давление продаж.`;
-      if(a.type==='swap'){const seed=(a.tx_hash||a.from_addr||'x').charCodeAt(2)%60;const mul=(2+seed/10).toFixed(1);return`<span class="hl">${esc(from)}</span> обменял <span class="hl">${amt} MNT</span> через DEX. Объём <span class="hl">${mul}x</span> выше 30d avg. Маршрут через <span class="hl">Merchant Moe</span>.`;}
-      return`<span class="hl">${esc(from)}</span> перевёл <span class="hl">${amt} MNT</span> → <span class="hl">${esc(to)}</span>. Крупное движение. AI Signal: <span class="${a.ai_signal?.toLowerCase().startsWith('buy')?'pos':'neg'}">${esc(a.ai_signal?.split('\n')[0]||'watch')}</span>`;
+      if(a.type==='swap'){const seed=((a.tx_hash||a.from_addr||'x').charCodeAt(2)||0)%60;const mul=(2+seed/10).toFixed(1);return`<span class="hl">${esc(from)}</span> обменял <span class="hl">${amt} MNT</span> через DEX. Объём <span class="hl">${mul}x</span> выше 30d avg. Маршрут через <span class="hl">Merchant Moe</span>`;}
+      return`<span class="hl">${esc(from)}</span> перевёл <span class="hl">${amt} MNT</span> → <span class="hl">${esc(to)}</span>. Крупное движение. AI Signal: <span class="${(a.ai_signal||'').toLowerCase().startsWith('buy')?'pos':'neg'}">${esc((a.ai_signal||'').split('\n')[0]||'watch')}</span>`;
     }
-    const[,sl,sc]=psig(alerts[0]?.ai_signal||'');
     document.getElementById('sig-list').innerHTML=alerts.map((a,i)=>{
       const ic=ICONS[a.type]||ICONS.transfer;
       const[,sgl,sgc]=psig(a.ai_signal);
+      const tsDisplay=a.timestamp?toMSK(a.timestamp):'—';
       return`<div class="sigc" style="animation-delay:${i*.07}s">
         <div class="sig-ic" style="background:${ic.bg};color:${ic.c}"><i class="fa-solid ${ic.i}"></i></div>
         <div class="sig-bd">
           <div class="sig-r1">
             <span class="sig-wl">${esc(a.from_label||sh(a.from_addr))}</span>
-            <span class="sig-tm"><i class="fa-regular fa-clock" style="margin-right:3px"></i>${rt(a.timestamp)}</span>
+            <span class="sig-tm"><i class="fa-regular fa-clock" style="margin-right:3px"></i>${tsDisplay}</span>
           </div>
           <div class="sig-tx">${genText(a)}</div>
           <div class="sig-tags">
