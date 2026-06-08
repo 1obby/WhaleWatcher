@@ -517,7 +517,7 @@ async function loadWallets(){
     // Обогащаем данные
     walletsData=data.map(w=>{
       const alpha=computeAlpha(w.cat,w.vol);
-      const monthPnl=+((alpha/100)*50-10+(vol%100)/100*10-5).toFixed(1);
+      const monthPnl = +((alpha/100)*50-10+(w.vol%100)/100*10-5).toFixed(1);
       const wr=+(50+(alpha/100)*35+(Math.random()-.5)*8).toFixed(1);
       return{...w,alpha,monthPnl,wr,spark:genSpark7(alpha)};
     });
