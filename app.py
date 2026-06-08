@@ -269,10 +269,10 @@ def api_stats():
 
     # Alpha Score из meta (пишется ботом)
     alpha_row   = db.execute(
-        "SELECT value FROM meta WHERE key='last_alpha_score'"
+        "SELECT value FROM meta WHERE key='alpha_score'"
     ).fetchone()
     signal_row  = db.execute(
-        "SELECT value FROM meta WHERE key='last_alpha_signal'"
+        "SELECT value FROM meta WHERE key='alpha_signal'"
     ).fetchone()
     thresh_row  = db.execute(
         "SELECT value FROM meta WHERE key='threshold_mnt'"
