@@ -509,7 +509,12 @@ async function loadChart(){
     const ctx=document.getElementById('ch').getContext('2d');
     if(alphaCh)alphaCh.destroy();
     alphaCh=new Chart(ctx,{type:'bar',
-      data:{labels:data.map(d=>d.label),datasets:[
+      data:{labels:data.map(d=>{
+        if(typeof d.bucket_timestamp==='number')
+          return new Date((d.bucket_timestamp+3*3600)*1000)
+            .toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+        return d.label;
+      }),datasets:[
         mk('transfer','rgba(124,58,237,.75)','Transfer'),
         mk('swap','rgba(6,182,212,.75)','Swap'),
         mk('cex_inflow','rgba(16,185,129,.75)','CEX In'),
@@ -624,6 +629,16 @@ async function loadWallets(){
   }
 }
 
+function fmtPnl(pnl){
+  if(pnl===null||pnl===undefined) return {str:'—', cls:'cgr', label:''};
+  const capped = Math.max(-500, Math.min(500, pnl));
+  const dots = Math.abs(pnl)>500 ? '…' : '';
+  const str = (capped>0?'+':'')+capped.toFixed(1)+'%'+dots;
+  if(pnl < -100) return {str, cls:'crd', label:'DIST'};
+  if(pnl > 50)  return {str, cls:'cgr', label:'ACCUM'};
+  return {str, cls: pnl>=0?'cgr':'crd', label:''};
+}
+
 function renderTop5(){
   const top=walletsData.slice(0,5);
   document.getElementById('d-top5').innerHTML=top.map((w,i)=>{
@@ -632,8 +647,7 @@ function renderTop5(){
     const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
     // sparkUp от соотношения first/last ненулевых точек кумулятива
     const sparkUp=computeSparkUp(w);
-    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>0?'+':''}${w.monthPnl}%`:'—';
-    const pnlColor=w.monthPnl===null||w.monthPnl===undefined?'color:var(--t3)':w.monthPnl>0?'color:var(--green)':w.monthPnl<0?'color:var(--red)':'color:var(--t3)';
+    const {str: pnlStr, cls: pnlClass, label: pnlLabel} = fmtPnl(w.monthPnl);
     return`<div class="tw">
       <div class="tw-n">${i+1}</div>
       <div class="tw-ic" style="background:${bg}">${em}</div>
@@ -643,7 +657,10 @@ function renderTop5(){
       </div>
       <div class="tw-ri">
         <div style="line-height:0">${ring(w.alpha,44)}</div>
-        <span style="font-size:.72rem;font-weight:800;${pnlColor}">${pnlStr}</span>
+        <div style="display:flex;align-items:center;justify-content:flex-end">
+          <span style="font-size:.72rem;font-weight:800" class="${pnlClass}">${pnlStr}</span>
+          ${pnlLabel ? `<span style="font-size:9px;opacity:.7;margin-left:3px">${pnlLabel}</span>` : ''}
+        </div>
         <div style="line-height:0;margin-top:2px">${sparkSvg(w.spark,sparkUp)}</div>
       </div>
     </div>`;
@@ -672,15 +689,17 @@ function renderWallets(){
     const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'');
     const cb=catBadge(w.cat);
     const sparkUp=computeSparkUp(w);
-    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>0?'+':''}${w.monthPnl}%`:'—';
-    const pnlClass=w.monthPnl===null||w.monthPnl===undefined?'cmu':w.monthPnl>0?'cgr':w.monthPnl<0?'crd':'cmu';
+    const {str: pnlStr, cls: pnlClass, label: pnlLabel} = fmtPnl(w.monthPnl);
     return`<div class="wc" style="animation:fup .25s ease ${i*.03}s both">
       <div class="wc-stripe" style="background:${stcol(w)}"></div>
       <div style="margin-left:4px;line-height:0">${ring(w.alpha,46)}</div>
       <div class="wc-body">
         <div class="wc-r1">
           <span class="wc-nm">${em} ${esc(nm)}</span>
-          <span class="wc-pnl ${pnlClass}">${pnlStr}</span>
+          <span class="wc-pnl" style="display:flex;align-items:center">
+            <span class="${pnlClass}">${pnlStr}</span>
+            ${pnlLabel ? `<span style="font-size:9px;opacity:.7;margin-left:3px">${pnlLabel}</span>` : ''}
+          </span>
         </div>
         <div class="wc-r2"><span class="b ${cb}">${esc(w.cat)}</span><span class="b btag" style="font-size:.58rem">${fmnt(w.vol24||w.vol)} MNT/24h</span></div>
         <div class="wc-meta">
@@ -765,13 +784,14 @@ function runSim(){
 }
 
 /* ── SIGNALS (из реальных алертов) ── */
+let sigOffset=0;const SIG_LIMIT=20;
 async function loadSignals(){
   try{
-    const data=await fetch('/api/alerts?limit=5&order=time')
+    const data=await fetch('/api/alerts?limit='+SIG_LIMIT+'&offset='+sigOffset+'&order=time')
       .then(r=>r.ok?r.json():Promise.reject(r.status))
       .catch(()=>({data:[]}));
     const alerts=data.data||[];
-    document.getElementById('sig-cnt').textContent=alerts.length+' New';
+    if(sigOffset===0)document.getElementById('sig-cnt').textContent=alerts.length+' New';
     const ICONS={transfer:{bg:'rgba(124,58,237,.15)',c:'#a78bfa',i:'fa-arrow-right-arrow-left'},swap:{bg:'rgba(6,182,212,.15)',c:'#22d3ee',i:'fa-rotate'},cex_inflow:{bg:'rgba(16,185,129,.15)',c:'#34d399',i:'fa-building-columns'},cex_outflow:{bg:'rgba(239,68,68,.15)',c:'#f87171',i:'fa-triangle-exclamation'}};
     const typeLabel={transfer:'TRANSFER',swap:'SWAP',cex_inflow:'CEX INFLOW',cex_outflow:'EXIT SIGNAL'};
     const typeBadge={transfer:'bt',swap:'bs',cex_inflow:'bi',cex_outflow:'bo'};
@@ -784,7 +804,7 @@ async function loadSignals(){
       if(a.type==='swap'){const seed=((a.tx_hash||a.from_addr||'x').charCodeAt(2)||0)%60;const mul=(2+seed/10).toFixed(1);return`<span class="hl">${esc(from)}</span> обменял <span class="hl">${amt} MNT</span> через DEX. Объём <span class="hl">${mul}x</span> выше 30d avg. Маршрут через <span class="hl">Merchant Moe</span>`;}
       return`<span class="hl">${esc(from)}</span> перевёл <span class="hl">${amt} MNT</span> → <span class="hl">${esc(to)}</span>. Крупное движение. AI Signal: <span class="${(a.ai_signal||'').toLowerCase().startsWith('buy')?'pos':'neg'}">${esc((a.ai_signal||'').split('\n')[0]||'watch')}</span>`;
     }
-    document.getElementById('sig-list').innerHTML=alerts.map((a,i)=>{
+    const html=alerts.map((a,i)=>{
       const ic=ICONS[a.type]||ICONS.transfer;
       const[,sgl,sgc]=psig(a.ai_signal);
       const tsDisplay=a.timestamp?toMSK(a.timestamp):'—';
@@ -804,7 +824,17 @@ async function loadSignals(){
           </div>
         </div>
       </div>`;
-    }).join('')||'<div class="em">Сигналов пока нет</div>';
+    }).join('');
+    const list=document.getElementById('sig-list');
+    if(sigOffset===0){
+      list.innerHTML=html||'<div class="em">Сигналов пока нет</div>';
+    }else{
+      const oldBtn=document.getElementById('sig-more');if(oldBtn)oldBtn.remove();
+      list.insertAdjacentHTML('beforeend',html);
+    }
+    if(alerts.length===SIG_LIMIT){
+      list.insertAdjacentHTML('beforeend',`<button id="sig-more" onclick="sigOffset+=SIG_LIMIT;loadSignals()" style="width:100%;margin-top:.5rem;padding:.7rem;border-radius:var(--r3);border:1px solid var(--border);background:var(--card);color:#a78bfa;font-family:'Poppins',sans-serif;font-size:.78rem;font-weight:600;cursor:pointer;">Загрузить ещё</button>`);
+    }
   }catch(e){document.getElementById('sig-list').innerHTML='<div class="em">⚠️ Ошибка загрузки</div>';console.error('signals',e)}
 }
 
