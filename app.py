@@ -315,11 +315,18 @@ def api_chart_hourly():
         buckets[hr][t]    += r["vol"]
         buckets[hr]["cnt"] += r["cnt"]
 
-    now_h   = datetime.now(timezone.utc).hour
+    now_utc = datetime.now(timezone.utc)
+    now_h   = now_utc.hour
     ordered = []
     for i in range(24):
-        hr = str((now_h - 23 + i) % 24).zfill(2)
-        ordered.append({"label": f"{hr}:00", **buckets[hr]})
+        hr_int = (now_h - 23 + i) % 24
+        hr     = str(hr_int).zfill(2)
+        # unix timestamp начала бакета (UTC, начало часа)
+        bucket_dt = now_utc.replace(hour=hr_int, minute=0, second=0, microsecond=0)
+        if hr_int > now_h:          # бакет из вчерашнего дня
+            bucket_dt -= timedelta(days=1)
+        bucket_ts = int(bucket_dt.timestamp())
+        ordered.append({"label": f"{hr}:00", "bucket_timestamp": bucket_ts, **buckets[hr]})
 
     return jsonify(ordered)
 
