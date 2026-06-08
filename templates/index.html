@@ -388,14 +388,14 @@ function ring(s,sz=66){
 }
 
 /* ── SPARKLINE SVG ── */
-function spark(data,w=76,h=26){
+function spark(data,up,w=76,h=26){
   if(!data||data.length===0)return`<svg width="${w}" height="${h}"></svg>`;
   if(data.length===1)data=[data[0],data[0]];
   const mn=Math.min(...data),mx=Math.max(...data),rng=mx-mn||1;
   const pts=data.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-mn)/rng)*(h-2)-1}`).join(' ');
-  const up=data[data.length-1]>=data[0];
+  const col=up?'#10b981':'#ef4444';
   return`<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg">
-    <polyline points="${pts}" fill="none" stroke="${up?'#10b981':'#ef4444'}" stroke-width="1.8"
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.8"
       stroke-linejoin="round" stroke-linecap="round"/>
   </svg>`;
 }
@@ -405,20 +405,18 @@ const CAT_REP={'Smart Money':15,'Mega Whale':15,'Active DeFi Trader':12,'Whale C
   'Accumulator':10,'High-freq Trader':10,'OTC Distributor':8,'CEX':8,'Potential Whale':8,
   'Large Accumulator':8,'High-frequency':6,'Personal Relay':6,'Large Sender':6,
   'Bybit-funded':4,'DEX':5,'Protocol':2,'Unknown':1,'Routing':4};
-function computeAlpha(cat,vol24){
+function computeAlpha(cat,vol24,addr){
   const rep=Math.min(40,CAT_REP[cat]||4);
   const vs=Math.min(30,Math.floor(Math.log10(Math.max(vol24,1))*6));
-  const mkt=Math.floor(8+Math.random()*14);
+  const h=(addr||'').split('').reduce((s,c,i)=>s+(c.charCodeAt(0)*(i+1)),0);
+  const mkt=8+(h%14);
   return Math.min(99,rep+vs+mkt);
 }
-function genSpark7(alpha,addr){
-  const trend=(alpha-50)/200;
-  const a=addr||'';
-  let v=50+((a.charCodeAt(0)||0)%20);
-  return Array.from({length:7},(_,i)=>{
-    const seed=((a.charCodeAt(i%Math.max(a.length,1))||0)+i*7)%100/100-.5;
-    v+=(seed*0.6-.47+trend)*8;
-    return Math.max(15,Math.min(95,v));
+function genSpark(addr){
+  const a=addr||'x';
+  return Array.from({length:30},(_,i)=>{
+    const seed=(a.charCodeAt(i%a.length)*31+i*17)%200/100-1;
+    return seed*2;
   });
 }
 
@@ -442,7 +440,7 @@ async function loadStats(){
     try{s('i-max').textContent=fmnt(d.max_volume||0)+' MNT'}catch(_){}
     try{s('i-th').textContent=d.threshold_mnt??50}catch(_){}
     try{s('i-lst').textContent=d.last_ts?fdt(d.last_ts):'—'}catch(_){}
-    if(d.last_ts)try{s('hdr-t').textContent=rt(d.last_ts)}catch(_){}
+    if(d.last_ts){lastUpdate=new Date(d.last_ts).getTime();tickTimer();}
     const sc=d.alpha_score,sg=d.alpha_signal||'watch';
     if(sc!=null){
       s('a-n').textContent=sc;
@@ -529,10 +527,11 @@ async function loadWallets(){
     const data=await(await fetch('/api/top_wallets')).json();
     // Обогащаем данные
     walletsData=data.map(w=>{
-      const alpha=computeAlpha(w.cat,w.vol);
+      const alpha=computeAlpha(w.cat,w.vol,w.addr);
       const monthPnl = +((alpha/100)*50-10+(w.vol%100)/100*10-5).toFixed(1);
-      const wr=+(50+(alpha/100)*35+(Math.random()-.5)*8).toFixed(1);
-      return{...w,alpha,monthPnl,wr,spark:genSpark7(alpha,w.addr)};
+      const addrHash=(w.addr||'').split('').reduce((s,c)=>s+c.charCodeAt(0),0);
+      const wr=+(50+(alpha/100)*35+((addrHash%100)/100-.5)*8).toFixed(1);
+      return{...w,alpha,monthPnl,wr,spark:genSpark(w.addr)};
     });
     sortedW=[...walletsData];
     renderWallets();
@@ -561,7 +560,7 @@ function renderTop5(){
       <div class="tw-ri">
         <div style="line-height:0">${ring(w.alpha,44)}</div>
         <span style="font-size:.72rem;font-weight:800;${w.monthPnl>=0?'color:var(--green)':'color:var(--red)'}">${w.monthPnl>=0?'+':''}${w.monthPnl}%</span>
-        <div style="line-height:0;margin-top:2px">${spark(w.spark)}</div>
+        <div style="line-height:0;margin-top:2px">${spark(w.spark,w.monthPnl>=0)}</div>
       </div>
     </div>`;
   }).join('');
@@ -597,7 +596,7 @@ function renderWallets(){
           <div class="mi"><i class="fa-solid fa-bullseye"></i>${w.wr}% WR</div>
         </div>
       </div>
-      <div style="line-height:0">${spark(w.spark)}</div>
+      <div style="line-height:0">${spark(w.spark,w.monthPnl>=0)}</div>
     </div>`;
   }).join('');
 }
@@ -652,15 +651,15 @@ function runSim(){
         <div class="rdv"></div>
         <div class="rb"><div class="rv" style="color:var(--t2)">${hp>=0?'+':''}${hp}%</div><div class="rl">MNT Hold</div></div>
       </div>
-      <div class="out" style="background:${obg};border:1px solid ${obr}" class="${oc}">
+      <div class="out ${oc}" style="background:${obg};border:1px solid ${obr}">
         <i class="fa-solid fa-bolt"></i>
         <span class="${oc}">${op>=0?'Outperformed':'Underperformed'} MNT Hold на ${op>=0?'+':''}${op}% за ${selPer}д</span>
       </div>
       <div class="rg">
         <div class="rm2"><div class="rm2v">${wr}%</div><div class="rm2l">Win Rate</div></div>
         <div class="rm2"><div class="rm2v">${trades}</div><div class="rm2l">Trades</div></div>
-        <div class="rm2"><div class="rm2v cgr">+${bf}%</div><div class="rm2l">Best Trade</div></div>
-        <div class="rm2"><div class="rm2v crd">${wf}%</div><div class="rm2l">Worst Trade</div></div>
+        <div class="rm2"><div class="rm2v ${bf>0?'cgr':'cmu'}">${bf>0?'+':''}${bf}%</div><div class="rm2l">Best Trade</div></div>
+        <div class="rm2"><div class="rm2v crd">${wf<=0?'':'-'}${Math.abs(wf)}%</div><div class="rm2l">Worst Trade</div></div>
       </div>
       <div class="card" style="padding:.85rem">
         <div class="card-ttl" style="margin-bottom:.5rem"><i class="fa-solid fa-robot"></i>&nbsp; AI Context</div>
@@ -687,7 +686,7 @@ async function loadSignals(){
       const amt=fmnt(a.value_mnt);
       if(a.type==='cex_outflow')return`<span class="hl">${esc(from)}</span> вывел <span class="hl">${amt} MNT</span> с биржи → кошелёк <span class="hl">${esc(to)}</span>. Паттерн накопления.`;
       if(a.type==='cex_inflow')return`<span class="hl">${esc(from)}</span> отправил <span class="hl">${amt} MNT</span> на биржу <span class="hl">${esc(to)}</span>. Потенциальное давление продаж.`;
-      if(a.type==='swap')return`<span class="hl">${esc(from)}</span> обменял <span class="hl">${amt} MNT</span> через DEX. Объём <span class="hl">${(2+Math.random()*6).toFixed(1)}x</span> выше 30d avg. Маршрут через <span class="hl">Merchant Moe</span>.`;
+      if(a.type==='swap'){const seed=(a.tx_hash||a.from_addr||'x').charCodeAt(2)%60;const mul=(2+seed/10).toFixed(1);return`<span class="hl">${esc(from)}</span> обменял <span class="hl">${amt} MNT</span> через DEX. Объём <span class="hl">${mul}x</span> выше 30d avg. Маршрут через <span class="hl">Merchant Moe</span>.`;}
       return`<span class="hl">${esc(from)}</span> перевёл <span class="hl">${amt} MNT</span> → <span class="hl">${esc(to)}</span>. Крупное движение. AI Signal: <span class="${a.ai_signal?.toLowerCase().startsWith('buy')?'pos':'neg'}">${esc(a.ai_signal?.split('\n')[0]||'watch')}</span>`;
     }
     const[,sl,sc]=psig(alerts[0]?.ai_signal||'');
@@ -714,9 +713,16 @@ async function loadSignals(){
   }catch(e){document.getElementById('sig-list').innerHTML='<div class="em">⚠️ Ошибка загрузки</div>';console.error('signals',e)}
 }
 
-/* ── CLOCK ── */
-const clk=()=>document.getElementById('hdr-t').textContent=new Date().toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'});
-setInterval(clk,60000);clk();
+/* ── CLOCK / RELATIVE TIMER ── */
+let lastUpdate=null;
+function tickTimer(){
+  const el=document.getElementById('hdr-t');
+  if(lastUpdate===null){el.textContent=new Date().toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'});return;}
+  const s=Math.floor((Date.now()-lastUpdate)/1000);
+  if(s<60)el.textContent=s+'с назад';
+  else if(s<3600)el.textContent=Math.floor(s/60)+'м назад';
+  else el.textContent=Math.floor(s/3600)+'ч назад';
+}
 
 /* ── LOAD ALL ── */
 async function loadAll(h){
@@ -724,7 +730,10 @@ async function loadAll(h){
   await Promise.all([loadStats(),loadPrice(),loadChart(),loadWallets(),loadSignals()]);
   document.getElementById('ndot').style.display='block';
 }
-setInterval(loadAll,30000);
+if(window._pollInterval)clearInterval(window._pollInterval);
+if(window._timerInterval)clearInterval(window._timerInterval);
+window._pollInterval=setInterval(loadAll,30000);
+window._timerInterval=setInterval(tickTimer,1000);tickTimer();
 loadAll();
 </script>
 </body>
