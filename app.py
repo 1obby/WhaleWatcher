@@ -370,10 +370,13 @@ def api_wallet_spark(addr: str):
       last_nonzero   — значение последней ненулевой точки (или null)
       has_data       — true если хотя бы 1 бакет ненулевой по нетто
       first_seen     — unix-timestamp первой транзакции кошелька (или null)
+      inflow         — суммарный приток за весь период
+      outflow        — суммарный отток за весь период
     """
     _EMPTY = {
         "spark": [], "first_nonzero": None, "last_nonzero": None,
         "has_data": False, "first_seen": None,
+        "inflow": 0.0, "outflow": 0.0,
     }
     try:
         period = request.args.get("period", "3d").strip().lower()
@@ -421,6 +424,22 @@ def api_wallet_spark(addr: str):
             outflow = float(outflow_row["vol"]) if outflow_row else 0.0
             net_vals.append(inflow - outflow)
 
+        # ── Суммарные значения за весь период ────────────────────────────────
+        period_start = (now - timedelta(hours=step_hours * n_points)).isoformat()
+
+        total_inflow_row = db.execute("""
+            SELECT COALESCE(SUM(value_mnt), 0) AS vol FROM alerts
+            WHERE to_addr LIKE ? AND timestamp >= ?
+        """, (like, period_start)).fetchone()
+
+        total_outflow_row = db.execute("""
+            SELECT COALESCE(SUM(value_mnt), 0) AS vol FROM alerts
+            WHERE from_addr LIKE ? AND timestamp >= ?
+        """, (like, period_start)).fetchone()
+
+        total_inflow  = float(total_inflow_row["vol"])  if total_inflow_row  else 0.0
+        total_outflow = float(total_outflow_row["vol"]) if total_outflow_row else 0.0
+
         # ── Кумулятив ────────────────────────────────────────────────────────
         cumulative: list[float] = []
         running = 0.0
@@ -457,12 +476,13 @@ def api_wallet_spark(addr: str):
             "last_nonzero":  last_nonzero,
             "has_data":      has_data,
             "first_seen":    first_seen,
+            "inflow":        total_inflow,
+            "outflow":       total_outflow,
         })
 
     except Exception as exc:
         app.logger.error("wallet_spark error for %s: %s", addr, exc)
         return jsonify(_EMPTY)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
