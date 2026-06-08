@@ -517,7 +517,7 @@ async function loadWallets(){
     // Обогащаем данные
     walletsData=data.map(w=>{
       const alpha=computeAlpha(w.cat,w.vol);
-      const monthPnl=+((alpha/100)*50-10+(Math.random()-.5)*15).toFixed(1);
+      const monthPnl=+((alpha/100)*50-10+(vol%100)/100*10-5).toFixed(1);
       const wr=+(50+(alpha/100)*35+(Math.random()-.5)*8).toFixed(1);
       return{...w,alpha,monthPnl,wr,spark:genSpark7(alpha)};
     });
@@ -601,6 +601,11 @@ function renderPaperGrid(){
 function selW(i,el){selWi=i;hap();document.querySelectorAll('.wi').forEach(e=>e.classList.remove('on'));el.classList.add('on');document.getElementById('sres').classList.remove('on')}
 function setPer(d,el){selPer=d;hap();document.querySelectorAll('.pb').forEach(b=>b.classList.remove('on'));el.classList.add('on');document.getElementById('sres').classList.remove('on')}
 function runSim(){
+  if(!walletsData.length){
+    document.getElementById('sres').innerHTML='<div class="em">⏳ Данные накапливаются. Вернитесь через несколько минут.</div>';
+    document.getElementById('sres').classList.add('on');
+    return;
+  }
   const btn=document.getElementById('simbtn');btn.disabled=true;btn.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Simulating…';
   const w=walletsData[selWi]||walletsData[0];
   setTimeout(()=>{
@@ -657,8 +662,8 @@ async function loadSignals(){
       const from=a.from_label||sh(a.from_addr);
       const to=a.to_label||sh(a.to_addr);
       const amt=fmnt(a.value_mnt);
-      if(a.type==='cex_outflow')return`<span class="hl">${esc(from)}</span> вывел <span class="hl">${amt} MNT</span> с биржи → кошелёк <span class="hl">${esc(to)}</span>. Паттерн накопления. Аналогичный сигнал предшествовал <span class="pos">+14% за 48ч</span>.`;
-      if(a.type==='cex_inflow')return`<span class="hl">${esc(from)}</span> отправил <span class="hl">${amt} MNT</span> на биржу <span class="hl">${esc(to)}</span>. Потенциальное давление продаж. Объём выше среднего на <span class="hl">3.2x</span>.`;
+      if(a.type==='cex_outflow')return`<span class="hl">${esc(from)}</span> вывел <span class="hl">${amt} MNT</span> с биржи → кошелёк <span class="hl">${esc(to)}</span>. Паттерн накопления.`;
+      if(a.type==='cex_inflow')return`<span class="hl">${esc(from)}</span> отправил <span class="hl">${amt} MNT</span> на биржу <span class="hl">${esc(to)}</span>. Потенциальное давление продаж.`;
       if(a.type==='swap')return`<span class="hl">${esc(from)}</span> обменял <span class="hl">${amt} MNT</span> через DEX. Объём <span class="hl">${(2+Math.random()*6).toFixed(1)}x</span> выше 30d avg. Маршрут через <span class="hl">Merchant Moe</span>.`;
       return`<span class="hl">${esc(from)}</span> перевёл <span class="hl">${amt} MNT</span> → <span class="hl">${esc(to)}</span>. Крупное движение. AI Signal: <span class="${a.ai_signal?.toLowerCase().startsWith('buy')?'pos':'neg'}">${esc(a.ai_signal?.split('\n')[0]||'watch')}</span>`;
     }
