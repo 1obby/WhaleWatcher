@@ -756,14 +756,18 @@ def analyze_batch_sync(
                         "You are a professional on-chain analyst specializing in Mantle Network whale behavior.\n"
                         "Analyze the provided transaction batch and output a concise, actionable signal.\n\n"
                         "PATTERN RECOGNITION RULES (apply in order, first match wins):\n"
-                        "1. If >50% of transfers go to CEX-tagged wallets (Bybit, OKX, Binance, etc.) → "
+                        "1. If >50% of transfers go TO CEX-tagged wallets (CEX is RECEIVER, not sender) → "  # FIX-PROMPT
                         'pattern: "CEX Deposit Flow", signal: SELL\n'
+                        "   IMPORTANT: If CEX-tagged wallet is the SENDER (withdrawal from exchange) → "
+                        "   this rule does NOT apply. Classify by destination wallet instead.\n"
                         "2. If transfer amounts are suspiciously uniform (all within 2% of each other) → "
                         'add flag: "Chunk Splitting Detected — automated distribution"\n'
                         "3. If OTC Distributor / Mega Whale is SENDER → "
                         'pattern: "Whale Distribution", signal: SELL\n'
                         "4. If Smart Money / OTC Distributor is RECEIVER → "
                         'pattern: "Smart Money Accumulation", signal: BUY\n'
+                        "4b. If CEX-tagged wallet is SENDER and destination is untagged or Smart Money → "  # FIX-PROMPT
+                        'pattern: "CEX Withdrawal — potential accumulation", signal: WATCH\n'
                         "5. If large DEX swap BUY (Merchant Moe / Agni Finance) → "
                         'pattern: "DEX Demand Spike", signal: BUY\n'
                         "6. If large DEX swap SELL → "
@@ -839,11 +843,16 @@ async def analyze_batch(
 # ALPHA SCORE — вычисление
 # =============================================================================
 
-def _parse_signal_direction(ai_signal: str) -> str:
-    low = ai_signal.lower()
-    if "sell" in low:
+def _parse_signal_direction(ai_signal: str) -> str:  # FIX-PARSE
+    """Извлекает направление только из строки **Signal:** — не из всего текста."""
+    import re
+    match = re.search(r"\*\*Signal:\s*(SELL|BUY|WATCH)", ai_signal, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    first_line = ai_signal.split("\n")[0].lower()
+    if "sell" in first_line:
         return "sell"
-    if "buy" in low:
+    if "buy" in first_line:
         return "buy"
     return "watch"
 
@@ -1588,7 +1597,7 @@ async def monitor_blocks() -> None:
 # =============================================================================
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура внизу экрана."""
+    """Постоянная клавиатура внизу экрана — всегда видна пользователю."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📈 Статистика"), KeyboardButton(text="🐳 Топ китов")],
@@ -1596,7 +1605,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="⭐ PRO-версия"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
-        persistent=True,   # не скрывается после нажатия
+        persistent=True,
         input_field_placeholder="Выберите команду...",
     )
 
