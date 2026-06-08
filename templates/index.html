@@ -394,7 +394,7 @@ function ring(s,sz=66){
 }
 
 /* ── SPARKLINE SVG ── */
-// sparkUp: true=green, false=red, null=grey (no data)
+// sparkUp: true=green, false=red, null=grey (нет данных)
 function sparkSvg(data,sparkUp,w=76,h=26){
   if(!data||data.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
   const filtered=data.filter(v=>typeof v==='number'&&isFinite(v));
@@ -407,6 +407,14 @@ function sparkSvg(data,sparkUp,w=76,h=26){
     <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.8"
       stroke-linejoin="round" stroke-linecap="round"/>
   </svg>`;
+}
+
+// Определяет направление спарклайна по first_nonzero / last_nonzero кумулятива
+// true=вверх(зелёный), false=вниз(красный), null=серый
+function computeSparkUp(w){
+  if(!w.hasData||w.firstNonzero===null||w.lastNonzero===null)return null;
+  if(w.firstNonzero===0)return null; // нулевая база → серый
+  return w.lastNonzero>w.firstNonzero?true:w.lastNonzero<w.firstNonzero?false:null;
 }
 
 /* ── ALPHA COMPUTE (по категории и объёму) ── */
@@ -553,22 +561,33 @@ async function reloadSparks(){
     const sparks=await Promise.all(walletsData.map(w=>
       fetch('/api/wallet_spark/'+encodeURIComponent(w.addr)+'?period='+sparkPeriod)
         .then(r=>r.ok?r.json():Promise.reject(r.status))
-        .catch(()=>({spark:[],first_seen:null,total_points:0}))
+        .catch(()=>({spark:[],first_nonzero:null,last_nonzero:null,has_data:false,first_seen:null}))
     ));
-    walletsData=walletsData.map((w,i)=>{
-      const s=sparks[i]||{spark:[],first_seen:null,total_points:0};
-      const sparkArr=Array.isArray(s.spark)?s.spark:[];
-      const nonZero=sparkArr.filter(v=>v>0);
-      const first=nonZero.length>0?nonZero[0]:null;
-      const last=nonZero.length>0?nonZero[nonZero.length-1]:null;
-      const monthPnl=(first!==null&&first>0)? +((last-first)/first*100).toFixed(1):null;
-      return{...w,spark:sparkArr,firstSeen:s.first_seen,totalPoints:s.total_points,monthPnl};
-    });
+    walletsData=walletsData.map((w,i)=>mergeSpark(w,sparks[i])).filter(w=>w.hasData);
     sortedW=[...walletsData];
     renderWallets();
     renderTop5();
     renderPaperGrid();
   }catch(e){console.error('reloadSparks',e)}
+}
+
+/* ── Мерж данных кошелька с ответом spark API ── */
+function mergeSpark(w, s){
+  const safe = s && typeof s==='object' ? s : {};
+  const sparkArr = Array.isArray(safe.spark) ? safe.spark : [];
+  const hasData  = !!safe.has_data;
+  const fnz      = typeof safe.first_nonzero==='number' ? safe.first_nonzero : null;
+  const lnz      = typeof safe.last_nonzero==='number'  ? safe.last_nonzero  : null;
+
+  let monthPnl = null;
+  if(hasData && fnz!==null && fnz!==0){
+    monthPnl = +((lnz-fnz)/Math.abs(fnz)*100).toFixed(1);
+  } else if(hasData && fnz===0){
+    monthPnl = 0;
+  }
+
+  return{...w, spark:sparkArr, firstSeen:safe.first_seen||null,
+         firstNonzero:fnz, lastNonzero:lnz, hasData, monthPnl};
 }
 
 async function loadWallets(){
@@ -585,21 +604,15 @@ async function loadWallets(){
     const sparks=await Promise.all(data.map(w=>
       fetch('/api/wallet_spark/'+encodeURIComponent(w.addr)+'?period='+sparkPeriod)
         .then(r=>r.ok?r.json():Promise.reject(r.status))
-        .catch(()=>({spark:[],first_seen:null,total_points:0}))
+        .catch(()=>({spark:[],first_nonzero:null,last_nonzero:null,has_data:false,first_seen:null}))
     ));
-    // Merge
+    // Merge + compute alpha + filter out wallets with no data
     walletsData=data.map((w,i)=>{
       const alpha=computeAlpha(w.cat,w.vol,w.addr);
-      const s=sparks[i]||{spark:[],first_seen:null,total_points:0};
-      const sparkArr=Array.isArray(s.spark)?s.spark:[];
-      const nonZero=sparkArr.filter(v=>v>0);
-      const first=nonZero.length>0?nonZero[0]:null;
-      const last=nonZero.length>0?nonZero[nonZero.length-1]:null;
-      const monthPnl=(first!==null&&first>0)? +((last-first)/first*100).toFixed(1):null;
       const addrHash=(w.addr||'').split('').reduce((s,c)=>s+c.charCodeAt(0),0);
       const wr=+(50+(alpha/100)*35+((addrHash%100)/100-.5)*8).toFixed(1);
-      return{...w,alpha,monthPnl,wr,spark:sparkArr,firstSeen:s.first_seen,totalPoints:s.total_points};
-    });
+      return mergeSpark({...w,alpha,wr},sparks[i]);
+    }).filter(w=>w.hasData);
     sortedW=[...walletsData];
     renderWallets();
     renderTop5();
@@ -617,13 +630,10 @@ function renderTop5(){
     const bg=CAT_BG[w.cat]||CAT_BG.Unknown;
     const lbl=w.label||'Unknown';
     const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
-    // Real spark color based on first vs last non-zero
-    const nonZero=(w.spark||[]).filter(v=>v>0);
-    const spFirst=nonZero.length>0?nonZero[0]:null;
-    const spLast=nonZero.length>0?nonZero[nonZero.length-1]:null;
-    const sparkUp=spFirst!==null&&spLast!==null?spLast>=spFirst:null;
-    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>=0?'+':''}${w.monthPnl}%`:'—';
-    const pnlColor=w.monthPnl===null||w.monthPnl===undefined?'color:var(--t3)':w.monthPnl>=0?'color:var(--green)':'color:var(--red)';
+    // sparkUp от соотношения first/last ненулевых точек кумулятива
+    const sparkUp=computeSparkUp(w);
+    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>0?'+':''}${w.monthPnl}%`:'—';
+    const pnlColor=w.monthPnl===null||w.monthPnl===undefined?'color:var(--t3)':w.monthPnl>0?'color:var(--green)':w.monthPnl<0?'color:var(--red)':'color:var(--t3)';
     return`<div class="tw">
       <div class="tw-n">${i+1}</div>
       <div class="tw-ic" style="background:${bg}">${em}</div>
@@ -661,21 +671,16 @@ function renderWallets(){
     const em=(lbl.match(/\p{Emoji}/u)||['🔷'])[0];
     const nm=lbl.replace(/^[\p{Emoji}\s]+/u,'');
     const cb=catBadge(w.cat);
-    // Real spark color
-    const nonZero=(w.spark||[]).filter(v=>v>0);
-    const spFirst=nonZero.length>0?nonZero[0]:null;
-    const spLast=nonZero.length>0?nonZero[nonZero.length-1]:null;
-    const sparkUp=spFirst!==null&&spLast!==null?spLast>=spFirst:null;
-    const noData=(w.totalPoints||0)<2;
-    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>=0?'+':''}${w.monthPnl}%`:'—';
-    const pnlClass=w.monthPnl===null||w.monthPnl===undefined?'cmu':w.monthPnl>=0?'cgr':'crd';
+    const sparkUp=computeSparkUp(w);
+    const pnlStr=w.monthPnl!==null&&w.monthPnl!==undefined?`${w.monthPnl>0?'+':''}${w.monthPnl}%`:'—';
+    const pnlClass=w.monthPnl===null||w.monthPnl===undefined?'cmu':w.monthPnl>0?'cgr':w.monthPnl<0?'crd':'cmu';
     return`<div class="wc" style="animation:fup .25s ease ${i*.03}s both">
       <div class="wc-stripe" style="background:${stcol(w)}"></div>
       <div style="margin-left:4px;line-height:0">${ring(w.alpha,46)}</div>
       <div class="wc-body">
         <div class="wc-r1">
           <span class="wc-nm">${em} ${esc(nm)}</span>
-          <span class="wc-pnl ${pnlClass}">${noData?'нет данных':pnlStr}</span>
+          <span class="wc-pnl ${pnlClass}">${pnlStr}</span>
         </div>
         <div class="wc-r2"><span class="b ${cb}">${esc(w.cat)}</span><span class="b btag" style="font-size:.58rem">${fmnt(w.vol24||w.vol)} MNT/24h</span></div>
         <div class="wc-meta">
