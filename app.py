@@ -351,10 +351,23 @@ def api_wallet_spark(addr: str):
     """
     GET /api/wallet_spark/<addr>?period=24h|3d|7d  (default: 3d)
 
-    Returns spark array + metadata for a wallet address.
-    Prefix = first 10 chars of addr (without leading 0x).
+    Возвращает кумулятивный нетто-поток кошелька по бакетам.
+    net_i = inflow_i - outflow_i
+    cumulative[i] = sum(net_0 .. net_i)
+
+    Prefix = первые 10 символов addr (без 0x).
+
+    Ответ:
+      spark          — массив кумулятивных значений (фикс. длины: 24/36/42)
+      first_nonzero  — значение первой ненулевой точки кумулятива (или null)
+      last_nonzero   — значение последней ненулевой точки (или null)
+      has_data       — true если хотя бы 1 бакет ненулевой по нетто
+      first_seen     — unix-timestamp первой транзакции кошелька (или null)
     """
-    _EMPTY = {"spark": [], "first_seen": None, "total_points": 0}
+    _EMPTY = {
+        "spark": [], "first_nonzero": None, "last_nonzero": None,
+        "has_data": False, "first_seen": None,
+    }
     try:
         period = request.args.get("period", "3d").strip().lower()
 
@@ -363,56 +376,80 @@ def api_wallet_spark(addr: str):
             "3d":  {"points": 36, "step_hours": 2},
             "7d":  {"points": 42, "step_hours": 4},
         }
-        cfg = PERIODS.get(period, PERIODS["3d"])
+        cfg        = PERIODS.get(period, PERIODS["3d"])
         n_points   = cfg["points"]
         step_hours = cfg["step_hours"]
 
-        # Strip leading "0x" / "0X" for prefix matching
-        clean = addr.lstrip("0x").lstrip("0X") if addr.lower().startswith("0x") else addr
+        # Убираем «0x» / «0X» для prefix-матчинга
+        clean  = addr[2:] if addr.lower().startswith("0x") else addr
         prefix = clean[:10]
+        like   = f"%{prefix}%"
 
         now = datetime.now(timezone.utc)
         db  = get_db()
 
-        spark_vals = []
+        # ── Строим бакеты: inflow - outflow ──────────────────────────────────
+        net_vals: list[float] = []
         for i in range(n_points):
             bucket_end   = now - timedelta(hours=step_hours * (n_points - 1 - i))
             bucket_start = bucket_end - timedelta(hours=step_hours)
+            ts0 = bucket_start.isoformat()
+            ts1 = bucket_end.isoformat()
 
-            row = db.execute("""
+            inflow_row = db.execute("""
                 SELECT COALESCE(SUM(value_mnt), 0) AS vol
                 FROM alerts
-                WHERE (from_addr LIKE ? OR to_addr LIKE ?)
+                WHERE to_addr LIKE ?
                   AND timestamp >= ? AND timestamp < ?
-            """, (
-                f"%{prefix}%",
-                f"%{prefix}%",
-                bucket_start.isoformat(),
-                bucket_end.isoformat(),
-            )).fetchone()
+            """, (like, ts0, ts1)).fetchone()
 
-            spark_vals.append(float(row["vol"]) if row else 0.0)
+            outflow_row = db.execute("""
+                SELECT COALESCE(SUM(value_mnt), 0) AS vol
+                FROM alerts
+                WHERE from_addr LIKE ?
+                  AND timestamp >= ? AND timestamp < ?
+            """, (like, ts0, ts1)).fetchone()
 
-        # first_seen: earliest transaction timestamp for this wallet
+            inflow  = float(inflow_row["vol"])  if inflow_row  else 0.0
+            outflow = float(outflow_row["vol"]) if outflow_row else 0.0
+            net_vals.append(inflow - outflow)
+
+        # ── Кумулятив ────────────────────────────────────────────────────────
+        cumulative: list[float] = []
+        running = 0.0
+        for net in net_vals:
+            running += net
+            cumulative.append(round(running, 4))
+
+        # ── Метаданные ───────────────────────────────────────────────────────
+        has_data = any(v != 0.0 for v in cumulative)
+
+        nonzero_vals = [v for v in cumulative if v != 0.0]
+        first_nonzero = nonzero_vals[0]  if nonzero_vals else None
+        last_nonzero  = nonzero_vals[-1] if nonzero_vals else None
+
+        # first_seen: самая ранняя транзакция кошелька
         first_row = db.execute("""
             SELECT MIN(timestamp) AS ts FROM alerts
             WHERE from_addr LIKE ? OR to_addr LIKE ?
-        """, (f"%{prefix}%", f"%{prefix}%")).fetchone()
+        """, (like, like)).fetchone()
 
         first_seen = None
         if first_row and first_row["ts"]:
             try:
-                dt = datetime.fromisoformat(first_row["ts"].replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(
+                    first_row["ts"].replace("Z", "+00:00")
+                )
                 first_seen = int(dt.timestamp())
             except Exception:
-                first_seen = None
-
-        total_points = sum(1 for v in spark_vals if v > 0)
+                pass
 
         return jsonify({
-            "spark":        spark_vals,
-            "first_seen":   first_seen,
-            "total_points": total_points,
+            "spark":         cumulative,
+            "first_nonzero": first_nonzero,
+            "last_nonzero":  last_nonzero,
+            "has_data":      has_data,
+            "first_seen":    first_seen,
         })
 
     except Exception as exc:
