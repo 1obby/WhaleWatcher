@@ -234,8 +234,8 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
   <div class="sc" id="s2">
     <div class="shdr"><div class="sttl">Smart Wallets <span style="color:var(--t3);font-weight:400" id="w-cnt"></span></div><span class="b bsm"><i class="fa-solid fa-network-wired"></i>&nbsp;Mantle</span></div>
     <div class="sb" id="spark-period-bar" style="margin-bottom:.45rem">
-      <button class="sbt" onclick="setSparkPeriod('24h',this)">24ч</button>
-      <button class="sbt on" id="sp-btn-3d" onclick="setSparkPeriod('3d',this)">3д</button>
+      <button class="sbt on" onclick="setSparkPeriod('24h',this)">24ч</button>
+      <button class="sbt" id="sp-btn-3d" onclick="setSparkPeriod('3d',this)">3д</button>
       <button class="sbt" onclick="setSparkPeriod('7d',this)">7д</button>
     </div>
     <div class="sb" id="sort-bar">
@@ -304,7 +304,9 @@ function sparkSvg(data,sparkUp,w=76,h=26){
   if(!data||data.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
   const filtered=data.filter(v=>typeof v==='number'&&isFinite(v));
   if(filtered.length===0)return`<svg width="${w}" height="${h}"><text x="${w/2}" y="${h/2+4}" text-anchor="middle" fill="#555" font-size="8" font-family="Poppins,sans-serif">нет данных</text></svg>`;
-  const d2=filtered.length===1?[filtered[0],filtered[0]]:filtered;
+  const firstNZ=filtered.findIndex(v=>v!==0);
+  const trimmed=firstNZ>0?filtered.slice(firstNZ):filtered;
+  const d2=trimmed.length===0?[0,0]:trimmed.length===1?[0,trimmed[0]]:trimmed;
   const mn=Math.min(...d2),mx=Math.max(...d2),rng=mx-mn||1;
   const pts=d2.map((v,i)=>`${(i/(d2.length-1))*w},${h-((v-mn)/rng)*(h-2)-1}`).join(' ');
   const col=sparkUp===null?'#555':sparkUp?'#00ff88':'#ff4466';
@@ -332,7 +334,7 @@ function toMSK(ts){
   }catch{return'—'}
 }
 let walletsData=[],sortedW=[],selPer=7,selWi=0,alphaCh=null;
-let sparkPeriod='3d';
+let sparkPeriod='24h';
 const rnd=(mn,mx)=>mn+(Math.random()*(mx-mn));
 async function loadStats(){
   try{
@@ -484,12 +486,12 @@ function fmtPnl(pnl){
   return{str,cls:pnl>0?'cgr':'crd',label:''};
 }
 function fmtNet(net){
-  if(!net)return{str:'0 MNT',cls:'cmu',label:''};
+  if(Math.abs(net||0)<0.01)return{str:'0 MNT',cls:'cmu',label:''};
   const abs=Math.abs(net);
   const f=abs>=1000000?(abs/1000000).toFixed(1)+'M':abs>=1000?(abs/1000).toFixed(1)+'K':abs.toFixed(0);
   return net>0
-    ?{str:'▲ +'+f+' MNT',cls:'cgr',label:'ACCUM'}
-    :{str:'▼ −'+f+' MNT',cls:'crd',label:'DIST'};
+    ?{str:'▲ +'+f+' MNT',cls:'cgr',label:net>100?'ACCUM':''}
+    :{str:'▼ −'+f+' MNT',cls:'crd',label:net<-100?'DIST':''};
 }
 function renderTop5(){
   const top=walletsData.slice(0,5);
