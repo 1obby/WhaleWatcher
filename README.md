@@ -52,17 +52,15 @@ Mantle RPC ──► monitor_blocks()
               transaction buffer (1-min window)
                     │
                     ▼
-         aggregate_and_send()
-              │         │
-              ▼         ▼
-         Alpha Score   Qwen AI
-         (0-100)       (BUY/SELL/WATCH)
-              │
-              ▼
-         Telegram alert + prediction saved to SQLite
-                    │
-                    ▼ (every 5 min)
-         resolve_predictions() → /accuracy stats
+           aggregate_and_send()
+              │          │
+              ▼          ▼
+          Alpha Score  Qwen AI
+          (0-100)    (BUY/SELL/WATCH)
+             │            │
+             └──────┬─────┘
+                    ▼
+     Telegram alert + prediction saved to SQLite
 ```
 
 **Stack:** Python 3.12 · aiogram 3.x · web3.py 6.x · SQLite WAL · Qwen AI (ModelScope) · Flask · Railway
