@@ -1,11 +1,3 @@
-# =============================================================================
-# Mantle Network — мониторинг + агрегация + тегирование кошельков
-# v8: +авторизация, +dynamic token0/token1, +semaphore, +price_cache lock,
-#     +catchup cap, +flood control send_telegram
-# v9: +Agni Finance (Uniswap V3 fork), +decode_agni_swap_log, +DEX label in alerts
-# Зависимости: pip install web3 requests openai python-dotenv "aiogram>=3.4"
-# =============================================================================
-
 import asyncio
 import functools
 import json
