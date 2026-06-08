@@ -484,7 +484,7 @@ def init_db() -> None:
                 value TEXT
             )
         """)
-        # ↓ НОВАЯ ТАБЛИЦА
+        # ↓ НОВАЯ ТАБЛИЦА — FIX-INTERVALS: полный набор временных интервалов верификации
         conn.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -493,14 +493,34 @@ def init_db() -> None:
                 price_at     REAL,
                 alpha_score  INTEGER,
                 total_mnt    REAL,
+                resolved_15m INTEGER DEFAULT NULL,
+                resolved_30m INTEGER DEFAULT NULL,
                 resolved_1h  INTEGER DEFAULT NULL,
+                resolved_2h  INTEGER DEFAULT NULL,
                 resolved_4h  INTEGER DEFAULT NULL,
+                resolved_8h  INTEGER DEFAULT NULL,
                 resolved_24h INTEGER DEFAULT NULL,
+                price_15m    REAL    DEFAULT NULL,
+                price_30m    REAL    DEFAULT NULL,
                 price_1h     REAL    DEFAULT NULL,
+                price_2h     REAL    DEFAULT NULL,
                 price_4h     REAL    DEFAULT NULL,
+                price_8h     REAL    DEFAULT NULL,
                 price_24h    REAL    DEFAULT NULL
             )
         """)
+        # FIX-INTERVALS: миграция — добавляем новые колонки если их нет
+        # (для существующих БД без новых интервалов)
+        for col, typ in [
+            ("resolved_15m", "INTEGER"), ("resolved_30m", "INTEGER"),
+            ("resolved_2h",  "INTEGER"), ("resolved_8h",  "INTEGER"),
+            ("price_15m",    "REAL"),    ("price_30m",    "REAL"),
+            ("price_2h",     "REAL"),    ("price_8h",     "REAL"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ} DEFAULT NULL")
+            except Exception:
+                pass  # колонка уже существует — игнорируем
     conn.close()
     print(f"[DB] База данных инициализирована: {DB_FILE}")
 
@@ -1153,13 +1173,14 @@ async def aggregation_timer() -> None:
             print(f"[ERROR] aggregate_and_send: {e}")
 
 # =============================================================================
-# ВЕРИФИКАЦИЯ ПРЕДСКАЗАНИЙ — проверяем точность через 1/4/24 часа
+# ВЕРИФИКАЦИЯ ПРЕДСКАЗАНИЙ — FIX-INTERVALS: проверяем точность через 15м/30м/1ч/2ч/4ч/8ч/24ч
 # =============================================================================
 
 async def resolve_predictions() -> None:
-    """Проверяем предсказания через 1/4/24 часа после создания."""
+    """Проверяем предсказания через 15м/30м/1ч/2ч/4ч/8ч/24ч после создания.
+    FIX-INTERVALS: цикл запускается каждые 5 мин для своевременной верификации 15м интервала."""
     while True:
-        await asyncio.sleep(1800)  # каждые 30 минут
+        await asyncio.sleep(300)  # FIX-INTERVALS: каждые 5 мин для поддержки 15м интервала
         try:
             price_now, _ = await asyncio.to_thread(get_mnt_price)
             if not price_now or price_now <= 0:  # FIX-2
@@ -1170,29 +1191,48 @@ async def resolve_predictions() -> None:
             print(f"[PRED] Ошибка resolve: {e}")
 
 def _resolve_predictions_sync(price_now: float, now: datetime) -> None:
-    """Синхронная часть — обновляет resolved_*/price_* в БД."""
+    """Синхронная часть — обновляет resolved_*/price_* в БД.
+    FIX-INTERVALS: проверяет все 7 интервалов: 15м, 30м, 1ч, 2ч, 4ч, 8ч, 24ч."""
     with get_db() as conn:
+        # FIX-INTERVALS: выбираем поля всех новых интервалов; фильтр по resolved_24h IS NULL —
+        # строки остаются в выборке пока не заполнится последний (24ч) интервал
         rows = conn.execute(
             "SELECT id, created_at, signal, price_at, "
-            "resolved_1h, resolved_4h, resolved_24h "
-            "FROM predictions WHERE resolved_24h IS NULL"  # FIX-4
+            "resolved_15m, resolved_30m, resolved_1h, resolved_2h, "
+            "resolved_4h, resolved_8h, resolved_24h "
+            "FROM predictions WHERE resolved_24h IS NULL"
         ).fetchall()
         for row in rows:
-            pred_id, created_at_str, signal, price_at, *_ = row  # FIX-4: распаковка 7-колоночного row
+            # FIX-INTERVALS: распаковка 11-колоночного row
+            pred_id, created_at_str, signal, price_at, r15m, r30m, r1h, r2h, r4h, r8h, r24h = row
             if price_at is None:
                 continue
-            created   = datetime.fromisoformat(created_at_str)
-            elapsed_h = (now - created).total_seconds() / 3600
+            created    = datetime.fromisoformat(created_at_str)
+            elapsed_h  = (now - created).total_seconds() / 3600
             change_pct = (price_now - price_at) / price_at * 100
-            correct = (signal == "buy" and change_pct > 0) or (signal == "sell" and change_pct < 0)
-            updates = {}
-            if elapsed_h >= 1  and row[4] is None:  # FIX-4: resolved_1h из row, без N+1 SELECT
-                updates["resolved_1h"] = 1 if correct else 0
-                updates["price_1h"]    = price_now
-            if elapsed_h >= 4  and row[5] is None:  # FIX-4: resolved_4h из row, без N+1 SELECT
-                updates["resolved_4h"] = 1 if correct else 0
-                updates["price_4h"]    = price_now
-            if elapsed_h >= 24 and row[6] is None:  # FIX-4: resolved_24h из row, без N+1 SELECT
+            correct    = (signal == "buy" and change_pct > 0) or (signal == "sell" and change_pct < 0)
+            updates: dict = {}
+            # FIX-INTERVALS: проверка каждого интервала — пишем только если прошло достаточно
+            # времени и колонка ещё не заполнена (избегаем перезаписи верифицированного результата)
+            if elapsed_h >= 0.25 and r15m is None:
+                updates["resolved_15m"] = 1 if correct else 0
+                updates["price_15m"]    = price_now
+            if elapsed_h >= 0.5  and r30m is None:
+                updates["resolved_30m"] = 1 if correct else 0
+                updates["price_30m"]    = price_now
+            if elapsed_h >= 1    and r1h  is None:
+                updates["resolved_1h"]  = 1 if correct else 0
+                updates["price_1h"]     = price_now
+            if elapsed_h >= 2    and r2h  is None:
+                updates["resolved_2h"]  = 1 if correct else 0
+                updates["price_2h"]     = price_now
+            if elapsed_h >= 4    and r4h  is None:
+                updates["resolved_4h"]  = 1 if correct else 0
+                updates["price_4h"]     = price_now
+            if elapsed_h >= 8    and r8h  is None:
+                updates["resolved_8h"]  = 1 if correct else 0
+                updates["price_8h"]     = price_now
+            if elapsed_h >= 24   and r24h is None:
                 updates["resolved_24h"] = 1 if correct else 0
                 updates["price_24h"]    = price_now
             if updates:
@@ -1918,7 +1958,11 @@ def _get_accuracy_stats() -> str:
                 "Предсказаний пока нет. Данные появятся после первых BUY/SELL сигналов."
             )
 
-        _ALLOWED_PRED_COLS = frozenset({"resolved_1h", "resolved_4h", "resolved_24h"})  # FIX-5
+        # FIX-INTERVALS: белый список колонок для защиты от SQL-инъекций через имя колонки
+        _ALLOWED_PRED_COLS = frozenset({
+            "resolved_15m", "resolved_30m", "resolved_1h", "resolved_2h",
+            "resolved_4h",  "resolved_8h",  "resolved_24h"
+        })
 
         def pct(col: str) -> str:
             if col not in _ALLOWED_PRED_COLS:  # FIX-5: блокируем SQL-injection через имя колонки
@@ -1933,13 +1977,18 @@ def _get_accuracy_stats() -> str:
             correct = correct or 0  # FIX-F: SUM() возвращает None если нет подходящих строк
             return f"{int(correct / n * 100)}% ({int(correct)}/{n})"
 
+        # FIX-INTERVALS: отображаем статистику по всем 7 интервалам верификации
         lines = [
             "📊 <b>Точность AI-сигналов WhaleWatcher</b>",
             "",
             f"Всего предсказаний (BUY/SELL): <b>{total}</b>",
             "",
+            f"✅ Через 15м: <b>{pct('resolved_15m')}</b>",
+            f"✅ Через 30м: <b>{pct('resolved_30m')}</b>",
             f"✅ Через  1ч: <b>{pct('resolved_1h')}</b>",
+            f"✅ Через  2ч: <b>{pct('resolved_2h')}</b>",
             f"✅ Через  4ч: <b>{pct('resolved_4h')}</b>",
+            f"✅ Через  8ч: <b>{pct('resolved_8h')}</b>",
             f"✅ Через 24ч: <b>{pct('resolved_24h')}</b>",
             "",
             "<i>Верным считается сигнал если цена двинулась в предсказанном направлении.</i>",
