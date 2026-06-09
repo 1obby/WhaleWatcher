@@ -1205,7 +1205,7 @@ def _resolve_predictions_sync(price_now: float, now: datetime) -> None:
         for row in rows:
             # FIX-INTERVALS: распаковка 11-колоночного row
             pred_id, created_at_str, signal, price_at, r15m, r30m, r1h, r2h, r4h, r8h, r24h = row
-            if price_at is None:
+            if price_at is None or price_at <= 0:
                 continue
             created    = datetime.fromisoformat(created_at_str)
             if created.tzinfo is None:
