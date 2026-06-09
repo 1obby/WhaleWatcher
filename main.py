@@ -1208,6 +1208,8 @@ def _resolve_predictions_sync(price_now: float, now: datetime) -> None:
             if price_at is None:
                 continue
             created    = datetime.fromisoformat(created_at_str)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
             elapsed_h  = (now - created).total_seconds() / 3600
             change_pct = (price_now - price_at) / price_at * 100
             correct    = (signal == "buy" and change_pct > 0) or (signal == "sell" and change_pct < 0)
