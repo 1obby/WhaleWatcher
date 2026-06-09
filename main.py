@@ -1929,6 +1929,18 @@ async def cmd_set_threshold(message: Message) -> None:
     )
     print(f"[CFG] Порог изменён: {old_threshold} -> {new_threshold} MNT")
 
+@dp.message(Command("reset_accuracy"))
+async def cmd_reset_accuracy(message: Message) -> None:
+    if not is_admin(message):
+        return
+    def _sync() -> int:
+        with get_db() as conn:
+            deleted = conn.execute("DELETE FROM predictions").rowcount
+            conn.commit()
+            return deleted
+    deleted = await asyncio.to_thread(_sync)
+    await message.answer(f"✅ Таблица предсказаний очищена. Удалено: {deleted} записей.\nНовые предсказания начнут накапливаться с нуля.")
+
 @dp.message(Command("accuracy"))
 async def cmd_accuracy(message: Message) -> None:
     """Показывает статистику точности AI-сигналов BUY/SELL."""
