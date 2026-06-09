@@ -425,7 +425,7 @@ async function reloadSparks(){
         .catch(()=>({spark:[],first_nonzero:null,last_nonzero:null,has_data:false,first_seen:null}))
     ));
     walletsData=walletsData.map((w,i)=>mergeSpark(w,sparks[i])).filter(w=>w.hasData);
-    sortedW=[...walletsData];
+    sortedW=[...walletsData].sort((a,b)=>b.alpha-a.alpha);
     renderWallets();renderTop5();renderPaperGrid();
   }catch(e){console.error('reloadSparks',e)}
 }
@@ -460,7 +460,7 @@ async function loadWallets(){
       const wr=+(50+(alpha/100)*35+((addrHash%100)/100-.5)*8).toFixed(1);
       return mergeSpark({...w,alpha,wr},sparks[i]);
     }).filter(w=>w.hasData);
-    sortedW=[...walletsData];
+    sortedW=[...walletsData].sort((a,b)=>b.alpha-a.alpha);
     renderWallets();renderTop5();renderPaperGrid();
   }catch(e){
     document.getElementById('d-top5').innerHTML='<div class="em">⚠️ Ошибка</div>';
