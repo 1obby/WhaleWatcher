@@ -192,7 +192,7 @@ AGNI_POOL_ADDRESS: str = ""
 # DEX: FusionX v3 (Uniswap V3 fork) — крупнейший DEX на Mantle по объёму
 # =============================================================================
 
-FUSIONX_FACTORY     = "0x530d2766D1988CC1c000C8b7d00334c14f314a35"  # FusionX V3 factory на Mantle
+FUSIONX_FACTORY     = "0x530d2766D1988CC1c000C8b7d00334c14B69AD71"  # FusionX V3 factory на Mantle
 FUSIONX_SWAP_TOPIC  = AGNI_SWAP_TOPIC  # V3 Swap topic одинаковый для всех V3 форков
 # Глобальная переменная — заполняется при старте через get_fusionx_pool_address()
 FUSIONX_POOL_ADDRESS: str = ""
@@ -201,7 +201,7 @@ FUSIONX_POOL_ADDRESS: str = ""
 # mETH — Mantle Staked ETH
 # =============================================================================
 
-METH_TOKEN_ADDRESS  = "0xcDA86A272531e8640cD7F1a92c01839711B90bb0"
+METH_TOKEN_ADDRESS = Web3.to_checksum_address("0xcda86a272531e8640cd7f1a92c01839711b90bb0")
 METH_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 # =============================================================================
