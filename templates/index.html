@@ -53,9 +53,10 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
 .p-val{font-size:1rem;font-weight:800;letter-spacing:-.3px}
 .p-chg{font-size:.7rem;font-weight:700;margin-top:2px;text-align:right}
 /* === TASK 1: TradingView widget === */
-.tv-wrap{border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,0.10);height:320px;margin-bottom:.4rem;background:#080b14;position:relative}
+.tv-wrap{border-radius:16px;overflow:hidden;border:1.5px solid rgba(124,58,237,0.5);height:320px;margin-bottom:.4rem;background:#080b14;position:relative;box-shadow:0 0 24px rgba(124,58,237,0.18),inset 0 0 40px rgba(124,58,237,0.06)}
+.tv-wrap::before{content:'';position:absolute;inset:0;pointer-events:none;z-index:2;border-radius:16px;background:linear-gradient(to right,rgba(124,58,237,0.12) 0%,transparent 15%,transparent 85%,rgba(124,58,237,0.12) 100%)}
 .tv-wrap iframe{width:100%;height:100%;border:none;display:block}
-.tv-open{display:inline-flex;align-items:center;gap:.25rem;color:#a78bfa;font-size:.65rem;font-weight:600;cursor:pointer;background:none;border:none;font-family:'Poppins',sans-serif;padding:.25rem .5rem;margin-bottom:.65rem}
+.tv-open{display:inline-flex;align-items:center;gap:.25rem;color:#a78bfa;text-shadow:0 0 8px rgba(124,58,237,0.4);font-size:.65rem;font-weight:600;cursor:pointer;background:none;border:none;font-family:'Poppins',sans-serif;padding:.25rem .5rem;margin-bottom:.65rem}
 .tv-open:hover{color:#c4b5fd}
 .sg{display:grid;grid-template-columns:repeat(3,1fr);gap:.55rem;margin-bottom:.65rem}
 .sc2{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:.75rem .7rem}
@@ -214,7 +215,7 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
     <div class="card-ttl" style="margin-bottom:.4rem"><i class="fa-solid fa-chart-candlestick"></i> ГРАФИК MNT/USDT</div>
     <div class="tv-wrap">
       <iframe
-        src="https://s.tradingview.com/widgetembed/?symbol=BYBIT%3AMNTUSDT&interval=15&theme=dark&style=1&locale=ru&toolbar_bg=%23080b14&enable_publishing=0&hide_side_toolbar=0&allow_symbol_change=0&studies=RSI%4014%2CMACD%4012%2C26%2C9%2CVolume&withdateranges=1&hideideas=1&saveimage=0&hidevolume=0"
+        src="https://s.tradingview.com/widgetembed/?symbol=BYBIT%3AMNTUSDT&interval=15&theme=dark&style=1&locale=ru&toolbar_bg=%230d0821&enable_publishing=0&hide_side_toolbar=0&allow_symbol_change=0&studies=RSI%4014%2CMACD%4012%2C26%2C9%2CVolume&withdateranges=1&hideideas=1&saveimage=0&hidevolume=0"
         allowtransparency="true" scrolling="no" allowfullscreen="" frameborder="0"></iframe>
     </div>
     <button class="tv-open" onclick="window.open('https://www.tradingview.com/chart/?symbol=BYBIT:MNTUSDT','_blank')">
