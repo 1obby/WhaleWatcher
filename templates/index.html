@@ -749,7 +749,7 @@ async function loadBatchReports(){
       const aiLines=(r.ai_text||'')
         .split('\n')
         .filter(l=>l.trim())
-        .map(l=>`<div style="font-size:.75rem;color:var(--t2);line-height:1.5">${esc(l)}</div>`)
+        .map(l => `<div style="font-size:.75rem;color:var(--t2);line-height:1.5">${l}</div>`)
         .join('');
       const ts=r.timestamp?toMSK(r.timestamp):'—';
       return`<div class="sigc" style="animation-delay:${i*.07}s">
