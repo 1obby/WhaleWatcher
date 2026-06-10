@@ -376,7 +376,7 @@ function toggleLang(){
   /* re-render dynamic lists to pick up new language */
   if(typeof renderWallets==='function')renderWallets();
   if(typeof renderTop5==='function')renderTop5();
-  if(typeof loadSignals==='function'){sigOffset=0;loadSignals();}
+  if(typeof loadBatchReports==='function'){sigOffset=0;loadBatchReports();}
 }
 applyLang();
 /* ── end i18n ─────────────────────────────────────────── */
@@ -725,54 +725,68 @@ function runSim(){
     hapN('success');
   },800+Math.random()*600);
 }
-let sigOffset=0;const SIG_LIMIT=20;
-/* === TASK 2: Signals — no tx_hash, bigger badges, bigger text === */
-async function loadSignals(){
+let sigOffset=0;
+async function loadBatchReports(){
   try{
-    const data=await fetch('/api/alerts?limit='+SIG_LIMIT+'&offset='+sigOffset+'&order=time')
-      .then(r=>r.ok?r.json():Promise.reject(r.status)).catch(()=>({data:[]}));
-    const alerts=data.data||[];
-    if(sigOffset===0)document.getElementById('sig-cnt').textContent=alerts.length+' '+LANG[window._lang].new_badge;
-    const ICONS={transfer:{bg:'rgba(124,58,237,.15)',c:'#a78bfa',i:'fa-arrow-right-arrow-left'},swap:{bg:'rgba(6,182,212,.15)',c:'#22d3ee',i:'fa-rotate'},cex_inflow:{bg:'rgba(16,185,129,.15)',c:'#34d399',i:'fa-building-columns'},cex_outflow:{bg:'rgba(239,68,68,.15)',c:'#f87171',i:'fa-triangle-exclamation'}};
-    const typeLabel={transfer:LANG[window._lang].tag_transfer,swap:LANG[window._lang].tag_swap,cex_inflow:LANG[window._lang].tag_cex_in,cex_outflow:LANG[window._lang].tag_cex_out,meth_transfer:LANG[window._lang].type_meth};
-    const typeBadge={transfer:'bt',swap:'bs',cex_inflow:'bi',cex_outflow:'bo'};
-    function genText(a){
-      const L=LANG[window._lang];
-      const from=a.from_label||L.sig_wallet;
-      const to=a.to_label||L.sig_recipient;
-      const amt=fmnt(a.value_mnt);
-      if(a.type==='cex_outflow')return`<span class="hl">${esc(from)}</span> ${L.sig_withdrew} <span class="hl">${amt} MNT</span> ${L.sig_from_exchange} ${L.sig_to} <span class="hl">${esc(to)}</span>. ${L.sig_accumulation}`;
-      if(a.type==='cex_inflow')return`<span class="hl">${esc(from)}</span> ${L.sig_sent_cex} <span class="hl">${amt} MNT</span> ${L.sig_to_exchange} <span class="hl">${esc(to)}</span>. ${L.sig_sell_pressure}`;
-      if(a.type==='swap')return`<span class="hl">${esc(from)}</span> ${L.sig_swapped} <span class="hl">${amt} MNT</span> ${L.sig_via_dex} <span class="hl">Merchant Moe</span>`;
-      return`<span class="hl">${esc(from)}</span> ${L.sig_transferred} <span class="hl">${amt} MNT</span> ${L.sig_to} <span class="hl">${esc(to)}</span>. ${L.sig_large_move}`;
+    const L=LANG[window._lang];
+    const data=await fetch('/api/batch_reports?limit=20&offset='+sigOffset)
+      .then(r=>r.ok?r.json():Promise.reject(r.status))
+      .catch(()=>({data:[]}));
+    const reports=data.data||[];
+
+    if(sigOffset===0){
+      document.getElementById('sig-cnt').textContent=reports.length+' '+L.new_badge;
     }
-    const html=alerts.map((a,i)=>{
-      const ic=ICONS[a.type]||ICONS.transfer;
-      const[,sgl,sgc]=psig(a.ai_signal);
-      const tsDisplay=a.timestamp?toMSK(a.timestamp):'—';
+
+    const sigMap={
+      buy:  ['bbuy','🟢 BUY'],
+      sell: ['bsel','🔴 SELL'],
+      watch:['bwat','🟡 WATCH'],
+    };
+
+    const html=reports.map((r,i)=>{
+      const[sgc,sgl]=sigMap[r.signal]||sigMap.watch;
+      const aiLines=(r.ai_text||'')
+        .split('\n')
+        .filter(l=>l.trim())
+        .map(l=>`<div style="font-size:.75rem;color:var(--t2);line-height:1.5">${esc(l)}</div>`)
+        .join('');
+      const ts=r.timestamp?toMSK(r.timestamp):'—';
       return`<div class="sigc" style="animation-delay:${i*.07}s">
-        <div class="sig-ic" style="background:${ic.bg};color:${ic.c}"><i class="fa-solid ${ic.i}"></i></div>
+        <div class="sig-ic" style="background:rgba(124,58,237,.15);color:#a78bfa">
+          <i class="fa-solid fa-chart-mixed"></i>
+        </div>
         <div class="sig-bd">
           <div class="sig-r1">
-            <span class="sig-wl">${esc(a.from_label||'Кошелёк')}</span>
-            <span class="sig-tm"><i class="fa-regular fa-clock" style="margin-right:3px"></i>${tsDisplay}</span>
+            <span class="sig-wl">Alpha Score: <b>${r.alpha_score}</b>/100</span>
+            <span class="sig-tm"><i class="fa-regular fa-clock" style="margin-right:3px"></i>${ts}</span>
           </div>
-          <div class="sig-tx">${genText(a)}</div>
+          <div style="margin:.3rem 0 .4rem;font-size:.75rem;color:var(--t3)">
+            ${r.tx_count} txn · ${fmnt(r.total_mnt)} MNT · $${(r.mnt_price||0).toFixed(4)}
+          </div>
+          ${aiLines?`<div style="background:rgba(255,255,255,.03);border-radius:8px;padding:.5rem .65rem;margin-bottom:.4rem">${aiLines}</div>`:''}
           <div class="sig-tags">
             <span class="b ${sgc} b-big">${sgl}</span>
-            <span class="b ${typeBadge[a.type]||'bt'}">${typeLabel[a.type]||(a.type||'unknown').toUpperCase()}</span>
-            ${(a.value_mnt||0)>1000?`<span class="b btag">${LANG[window._lang].tag_large}</span>`:''}
           </div>
         </div>
       </div>`;
     }).join('');
+
     const list=document.getElementById('sig-list');
-    if(sigOffset===0){list.innerHTML=html||`<div class="em">${LANG[window._lang].empty_signals}</div>`;}
-    else{const oldBtn=document.getElementById('sig-more');if(oldBtn)oldBtn.remove();list.insertAdjacentHTML('beforeend',html);}
-    if(alerts.length===SIG_LIMIT){
-      list.insertAdjacentHTML('beforeend',`<button id="sig-more" onclick="sigOffset+=SIG_LIMIT;loadSignals()" style="width:100%;margin-top:.5rem;padding:.7rem;border-radius:var(--r3);border:1px solid var(--border);background:var(--card);color:#a78bfa;font-family:'Poppins',sans-serif;font-size:.78rem;font-weight:600;cursor:pointer;">${LANG[window._lang].load_more}</button>`);
+    if(sigOffset===0){
+      list.innerHTML=html||`<div class="em">${L.empty_signals}</div>`;
+    }else{
+      const oldBtn=document.getElementById('sig-more');
+      if(oldBtn)oldBtn.remove();
+      list.insertAdjacentHTML('beforeend',html);
     }
-  }catch(e){document.getElementById('sig-list').innerHTML='<div class="em">⚠️ Ошибка загрузки</div>';console.error('signals',e)}
+    if(reports.length===20){
+      list.insertAdjacentHTML('beforeend',`<button id="sig-more" onclick="sigOffset+=20;loadBatchReports()" style="width:100%;margin-top:.5rem;padding:.7rem;border-radius:var(--r3);border:1px solid var(--border);background:var(--card);color:#a78bfa;font-family:'Poppins',sans-serif;font-size:.78rem;font-weight:600;cursor:pointer;">${L.load_more}</button>`);
+    }
+  }catch(e){
+    document.getElementById('sig-list').innerHTML='<div class="em">⚠️ Ошибка загрузки</div>';
+    console.error('batch_reports',e);
+  }
 }
 let lastUpdate=null;
 function tickTimer(){
@@ -785,7 +799,7 @@ function tickTimer(){
 }
 async function loadAll(h){
   if(h)hapN();
-  await Promise.all([loadStats(),loadPrice(),loadChart(),loadWallets(),loadSignals()]);
+  await Promise.all([loadStats(),loadPrice(),loadChart(),loadWallets(),loadBatchReports()]);
   document.getElementById('ndot').style.display='block';
 }
 if(window._pollInterval)clearInterval(window._pollInterval);
