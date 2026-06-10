@@ -3,6 +3,7 @@
 # v8: +авторизация, +dynamic token0/token1, +semaphore, +price_cache lock,
 #     +catchup cap, +flood control send_telegram
 # v9: +Agni Finance (Uniswap V3 fork), +decode_agni_swap_log, +DEX label in alerts
+# v10: +mETH (Mantle Staked ETH) ERC-20 Transfer мониторинг, +THRESHOLD_METH
 # Зависимости: pip install web3 requests openai python-dotenv "aiogram>=3.4"
 # =============================================================================
 
@@ -106,6 +107,8 @@ PRICE_CACHE_TTL = 5 * 60   # 5 минут
 _cfg = load_config()
 THRESHOLD_MNT: float = float(_cfg.get("threshold_mnt", 50))
 print(f"[CFG] Порог алертов: {THRESHOLD_MNT} MNT")
+THRESHOLD_METH: float = float(_cfg.get("threshold_meth", 500))
+print(f"[CFG] Порог mETH алертов: {THRESHOLD_METH} mETH")
 
 # FIX-B: ранняя проверка обязательных переменных окружения
 _required_env = ["MANTLE_RPC_URL", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
@@ -186,6 +189,22 @@ AGNI_FACTORY_ABI = [
 AGNI_POOL_ADDRESS: str = ""
 
 # =============================================================================
+# DEX: FusionX v3 (Uniswap V3 fork) — крупнейший DEX на Mantle по объёму
+# =============================================================================
+
+FUSIONX_FACTORY     = "0x530d2766D1988CC1c000C8b7d00334c14f314a35"  # FusionX V3 factory на Mantle
+FUSIONX_SWAP_TOPIC  = AGNI_SWAP_TOPIC  # V3 Swap topic одинаковый для всех V3 форков
+# Глобальная переменная — заполняется при старте через get_fusionx_pool_address()
+FUSIONX_POOL_ADDRESS: str = ""
+
+# =============================================================================
+# mETH — Mantle Staked ETH
+# =============================================================================
+
+METH_TOKEN_ADDRESS  = "0xcDA86A272531e8640cD7F1a92c01839711B90bb0"
+METH_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+# =============================================================================
 # TAGGED WALLETS
 # Структура: первый тег — роль/имя, второй — категория для Alpha Score
 # =============================================================================
@@ -205,6 +224,7 @@ TAGGED_WALLETS: dict[str, list[str]] = {
     # Mantle официальные контракты / казна
     "0xb9d507990c009Ed1ee853A07B6a20C0925DD8A08": ["Mantle: Budget L2",   "Protocol"],
     "0x78c1b0C915c4FAA5fFFa6cAbF0219DA63d7f4CB8": ["Mantle: WMNT Token",  "Protocol"],
+    "0xcDA86A272531e8640cD7F1a92c01839711B90bb0": ["Mantle: mETH Token",  "Protocol"],
     "0xeD884F0460A634c69DbB7DEf54858465808AACEf": ["Mantle: Rewards Stn", "Protocol"],
     "0xcD9Dab9Fa5b55eE4569EDc402D3206123B1285F4": ["Mantle: Treasury FF", "Protocol"],
     "0x94FEC56BbEcEAcc71C9e61623ACE9f8E1B1cf473": ["Mantle: Treasury L2", "Protocol"],
@@ -942,6 +962,51 @@ def format_alpha_line(score: int, signal_dir: str) -> str:
     )
 
 # =============================================================================
+# AI SIGNAL → TELEGRAM (отправка BUY/SELL в чат)
+# =============================================================================
+
+def _extract_reasoning(ai_signal: str, max_chars: int = 200) -> str:
+    """Достаёт читаемое объяснение из ответа AI (после Signal:... —...).
+    Убирает HTML-теги <b>/</b>, сжимает пробелы, обрезает до max_chars."""
+    if not ai_signal:
+        return ""
+    text = re.sub(r"<[^>]+>", "", ai_signal)
+    text = text.replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    # Пытаемся достать кусок после "Signal: BUY —..." до следующей метки
+    m = re.search(r"Signal:\s*(?:BUY|SELL|WATCH)\s*[—\-:]\s*(.+?)(?:Pattern:|Volume:|Key actor:|Flag:|$)",
+                  text, re.IGNORECASE)
+    if m:
+        text = m.group(1).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
+
+
+def format_ai_signal_message(
+    signal_dir: str,
+    price: float | None,
+    ai_signal_raw: str,
+    horizon: str = "15м–4ч",
+) -> str:
+    """Формирует HTML-сообщение для отправки AI-сигнала в Telegram-чат.
+    signal_dir ожидается 'buy' / 'sell' / 'watch'."""
+    sig_up = (signal_dir or "").upper()
+    emoji_map = {"BUY": "🟢", "SELL": "🔴", "WATCH": "🟡"}
+    emoji = emoji_map.get(sig_up, "🟡")
+    price_str = f"${price:.4f}" if (price and price > 0) else "—"
+    reasoning = _extract_reasoning(ai_signal_raw, max_chars=200) or "Анализ агрегированного батча."
+    # Уверенность модели мы не получаем явно от Qwen → используем эвристику от alpha_score
+    # Чтобы не путать пользователя — оставим строку, но без процента
+    return (
+        "🤖 <b>AI Сигнал · MNT/USDT</b>\n\n"
+        f"{emoji} <b>{sig_up}</b>  ·  {price_str}\n\n"
+        f"{reasoning}\n\n"
+        f"⏱ Горизонт: {horizon}\n"
+        "#AI #WhaleWatcher"
+    )
+
+# =============================================================================
 # ДОБАВЛЕНИЕ В БУФЕР
 #
 # Дедупликация вынесена в save_alert(): INSERT OR IGNORE + rowcount.
@@ -1090,8 +1155,8 @@ async def aggregate_and_send() -> None:
     await save_meta("alpha_score", str(alpha_score))   # FIX-META-1: save_meta — async, to_thread недопустим
     await save_meta("alpha_signal", signal_dir)
 
-    type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤"}
-    type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи"}
+    type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤", "meth_transfer": "💎"}
+    type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи", "meth_transfer": "mETH Перевод"}
 
     lines: list[str] = [
         f"📊 <b>Агрегированный отчёт Mantle</b> | {now_str}",
@@ -1158,6 +1223,26 @@ async def aggregate_and_send() -> None:
             )
         except Exception as e:
             print(f"[WARN] save_prediction не сохранено: {e}")
+
+        # === TASK 3: отправляем AI-сигнал BUY/SELL в Telegram-чат ===
+        # Дедупликация: один и тот же сигнал по той же цене не шлём дважды подряд
+        try:
+            dedup_key = (signal_dir, round(float(price or 0), 4))
+            last_key = getattr(aggregate_and_send, "_last_ai_signal_key", None)
+            if dedup_key != last_key:
+                msg = format_ai_signal_message(
+                    signal_dir=signal_dir,
+                    price=price,
+                    ai_signal_raw=ai_signal,
+                    horizon="15м–4ч",
+                )
+                await send_telegram(msg)
+                aggregate_and_send._last_ai_signal_key = dedup_key
+                print(f"[AI-SIG] Отправлен в чат: {signal_dir.upper()} @ ${price}")
+            else:
+                print(f"[AI-SIG] Дубликат сигнала {signal_dir.upper()} @ ${price} — пропущен")
+        except Exception as e:
+            print(f"[WARN] AI-сигнал не отправлен: {e}")
 
 # =============================================================================
 # ТАЙМЕР АГРЕГАЦИИ
@@ -1329,6 +1414,33 @@ async def get_agni_pool_address() -> str:
     raise RuntimeError("[AGNI] MNT/USDT пул не найден ни на одном fee-тире")
 
 # =============================================================================
+# FUSIONX — получение адреса пула MNT/USDT через factory.getPool()
+# Использует тот же IUniswapV3Factory ABI (AGNI_FACTORY_ABI).
+# Пробуем тиры 500, 3000, 10000 — берём первый непустой.
+# =============================================================================
+
+async def get_fusionx_pool_address() -> str:
+    """Определяет адрес пула MNT/USDT на FusionX v3 через вызов factory.getPool().
+    Перебирает fee-тиры 500, 3000, 10000 и возвращает первый найденный пул."""
+    factory = w3.eth.contract(
+        address=Web3.to_checksum_address(FUSIONX_FACTORY),
+        abi=AGNI_FACTORY_ABI,
+    )
+    wmnt = Web3.to_checksum_address(MNT_TOKEN_ADDRESS)
+    usdt = Web3.to_checksum_address(AGNI_USDT_ADDRESS)
+    zero = "0x0000000000000000000000000000000000000000"
+
+    for fee in [500, 3000, 10000]:
+        pool = await asyncio.to_thread(
+            factory.functions.getPool(wmnt, usdt, fee).call
+        )
+        if pool != zero:
+            print(f"[FUSIONX] Найден пул MNT/USDT fee={fee}: {pool}")
+            return pool
+
+    raise RuntimeError("[FUSIONX] MNT/USDT пул не найден ни на одном fee-тире")
+
+# =============================================================================
 # ОБРАБОТКА СОБЫТИЙ SWAP (Merchant Moe — Uniswap V2)
 # ИСПРАВЛЕНИЕ 2 — decode_swap_log теперь async, определяет позицию MNT динамически.
 # ИСПРАВЛЕНИЕ 1 — добавлены поля mnt_is_out и direction для корректного
@@ -1474,7 +1586,7 @@ async def decode_agni_swap_log(log: dict) -> dict | None:
 # =============================================================================
 
 async def process_swap_logs(from_block: int, to_block: int) -> None:
-    global AGNI_POOL_ADDRESS
+    global AGNI_POOL_ADDRESS, FUSIONX_POOL_ADDRESS
 
     # Автоматический retry адреса пула Agni Finance если при старте RPC был недоступен
     if not AGNI_POOL_ADDRESS:
@@ -1485,18 +1597,29 @@ async def process_swap_logs(from_block: int, to_block: int) -> None:
         except Exception as e:
             print(f"[AGNI] Retry не удался: {e}. Следующая попытка через {POLL_INTERVAL}с.")
 
+    # Автоматический retry адреса пула FusionX если при старте RPC был недоступен
+    if not FUSIONX_POOL_ADDRESS:
+        try:
+            FUSIONX_POOL_ADDRESS = await get_fusionx_pool_address()
+            TAGGED_WALLETS_LOWER[FUSIONX_POOL_ADDRESS.lower()] = ["FusionX Pool", "DEX"]
+            print(f"[FUSIONX] Пул восстановлен: {FUSIONX_POOL_ADDRESS}")
+        except Exception as e:
+            print(f"[FUSIONX] Retry не удался: {e}. Следующая попытка через {POLL_INTERVAL}с.")
+
     try:
-        # Формируем список активных пулов (Agni добавляется только если адрес получен)
+        # Формируем список активных пулов (Agni и FusionX добавляются только если адрес получен)
         dex_pools = [MERCHANT_MOE_POOL]
         if AGNI_POOL_ADDRESS:
             dex_pools.append(AGNI_POOL_ADDRESS)
+        if FUSIONX_POOL_ADDRESS:
+            dex_pools.append(FUSIONX_POOL_ADDRESS)
 
-        # OR-условие по topic[0]: вернёт логи любого из двух DEX за один RPC-вызов
+        # OR-условие по topic[0]: вернёт логи любого из трёх DEX за один RPC-вызов
         filter_params = {
             "fromBlock": from_block,
             "toBlock":   to_block,
             "address":   dex_pools,
-            "topics":    [[SWAP_TOPIC, AGNI_SWAP_TOPIC]],
+            "topics":    [[SWAP_TOPIC, AGNI_SWAP_TOPIC, FUSIONX_SWAP_TOPIC]],
         }
         logs = await rpc_get_logs(filter_params)
         if logs:
@@ -1511,6 +1634,10 @@ async def process_swap_logs(from_block: int, to_block: int) -> None:
                 decoded = await decode_swap_log(log)
             elif AGNI_POOL_ADDRESS and pool_addr == AGNI_POOL_ADDRESS.lower():
                 decoded = await decode_agni_swap_log(log)
+            elif FUSIONX_POOL_ADDRESS and pool_addr == FUSIONX_POOL_ADDRESS.lower():
+                decoded = await decode_agni_swap_log(log)   # V3, тот же декодер
+                if decoded:
+                    decoded["dex"] = "FusionX"
             else:
                 # Неизвестный пул — пропускаем
                 continue
@@ -1545,6 +1672,74 @@ async def process_swap_logs(from_block: int, to_block: int) -> None:
         print(f"[ERROR] process_swap_logs: {e}")
 
 # =============================================================================
+# ОБРАБОТКА TRANSFER СОБЫТИЙ mETH (Mantle Staked ETH)
+#
+# Слушает стандартные ERC-20 Transfer(address indexed from, address indexed to,
+# uint256 value) логи контракта mETH за диапазон блоков.
+# Фильтрует по THRESHOLD_METH. Вызывает fire_alert с event_type='meth_transfer'.
+# value_mnt передаётся как mETH-количество для совместимости с fire_alert/save_alert.
+# =============================================================================
+
+async def process_meth_logs(from_block: int, to_block: int) -> None:
+    try:
+        filter_params = {
+            "fromBlock": from_block,
+            "toBlock":   to_block,
+            "address":   METH_TOKEN_ADDRESS,
+            "topics":    [METH_TRANSFER_TOPIC],
+        }
+        logs = await rpc_get_logs(filter_params)
+        if logs:
+            print(f"[mETH] {len(logs)} Transfer событий в блоках {from_block}-{to_block}")
+
+        tasks = []
+        for log in logs:
+            try:
+                # topics[1] = from (indexed), topics[2] = to (indexed)
+                from_addr = Web3.to_checksum_address("0x" + log["topics"][1].hex()[-40:])
+                to_addr   = Web3.to_checksum_address("0x" + log["topics"][2].hex()[-40:])
+
+                # value в data: 32 байта uint256, делим на 1e18
+                raw_data = log["data"]
+                if isinstance(raw_data, bytes):
+                    raw_value = int.from_bytes(raw_data[:32], "big")
+                else:
+                    hex_str = raw_data[2:] if raw_data.startswith(("0x", "0X")) else raw_data
+                    raw_value = int(hex_str[:64], 16)
+
+                value_meth = raw_value / 1e18
+
+                if value_meth < THRESHOLD_METH:
+                    continue
+
+                tx_hash = log["transactionHash"].hex()
+                print(f"[mETH] Transfer {value_meth:.4f} mETH | {tx_hash}")
+
+                tasks.append(fire_alert(
+                    tx_hash     = tx_hash,
+                    value_mnt   = value_meth,   # совместимость: хранится в поле value_mnt
+                    from_addr   = from_addr,
+                    to_addr     = to_addr,
+                    event_type  = "meth_transfer",
+                    extra_lines = [
+                        f"💎 <b>Актив:</b> mETH (Mantle Staked ETH)",
+                        f"📦 <b>Объём:</b> {value_meth:,.4f} mETH",
+                    ],
+                    extra_log = {
+                        "asset":      "mETH",
+                        "raw_value":  raw_value,
+                        "value_meth": value_meth,
+                    },
+                ))
+            except Exception as e:
+                print(f"[mETH] Ошибка разбора лога: {e}")
+
+        if tasks:
+            await asyncio.gather(*tasks)
+    except Exception as e:
+        print(f"[ERROR] process_meth_logs: {e}")
+
+# =============================================================================
 # ОСНОВНОЙ ЦИКЛ МОНИТОРИНГА
 #
 # last_block загружается из meta-таблицы при старте — блоки не теряются
@@ -1558,7 +1753,7 @@ async def process_swap_logs(from_block: int, to_block: int) -> None:
 # =============================================================================
 
 async def monitor_blocks() -> None:
-    global AGNI_POOL_ADDRESS
+    global AGNI_POOL_ADDRESS, FUSIONX_POOL_ADDRESS
 
     # v9 — получаем адрес пула Agni Finance до начала мониторинга
     try:
@@ -1568,6 +1763,14 @@ async def monitor_blocks() -> None:
         print(f"[AGNI] Пул зарегистрирован: {AGNI_POOL_ADDRESS}")
     except Exception as e:
         print(f"[WARN] Не удалось получить адрес пула Agni Finance: {e}. Мониторинг V3 отключён.")
+
+    # Получаем адрес пула FusionX v3 до начала мониторинга
+    try:
+        FUSIONX_POOL_ADDRESS = await get_fusionx_pool_address()
+        TAGGED_WALLETS_LOWER[FUSIONX_POOL_ADDRESS.lower()] = ["FusionX Pool", "DEX"]
+        print(f"[FUSIONX] Пул зарегистрирован: {FUSIONX_POOL_ADDRESS}")
+    except Exception as e:
+        print(f"[WARN] FusionX пул не найден: {e}. Мониторинг FusionX отключён.")
 
     # ИСПРАВЛЕНИЕ 5 — загрузка last_block с ограничением на количество catchup-блоков
     # ИСПРАВЛЕНИЕ 2 — загрузка last_dex_block из meta; стартует от last_block если нет чекпойнта
@@ -1611,6 +1814,7 @@ async def monitor_blocks() -> None:
             dex_from = last_dex_block + 1
             if dex_from <= current_block:
                 await process_swap_logs(dex_from, current_block)
+                await process_meth_logs(dex_from, current_block)
             # ИСПРАВЛЕНИЕ 2 — персистируем last_dex_block в SQLite после каждой итерации
             last_dex_block = current_block
             await save_meta("last_dex_block", str(last_dex_block))
@@ -1697,6 +1901,9 @@ async def cmd_help(message: Message) -> None:
     text = (
         "❓ <b>Помощь WhaleWatcher</b>\n\n"
         "Все функции доступны через кнопки меню внизу экрана.\n\n"
+        "<b>🤖 AI сигналы BUY/SELL приходят сюда же автоматически</b>\n"
+        "после крупных движений китов. Сигналы WATCH не присылаются "
+        "(чтобы не спамить).\n\n"
         "<b>Единственная команда:</b>\n"
         f"/set_threshold N — изменить порог алертов\n"
         f"Пример: <code>/set_threshold 100</code>\n"
@@ -1704,8 +1911,8 @@ async def cmd_help(message: Message) -> None:
         "🌐 Dashboard — кнопка слева в поле ввода\n"
         "📬 Поддержка: @notuzo"
     )
-    await message.answer(text, parse_mode="HTML")
 
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("pro"))
 async def cmd_pro(message: Message) -> None:
@@ -1946,18 +2153,10 @@ async def cmd_accuracy(message: Message) -> None:
     """Показывает статистику точности AI-сигналов BUY/SELL."""
     if not is_authorized(message):
         return
-    # Команда доступна только PRO-пользователям
-    if not is_pro(message):
-        await message.answer(
-            "🔒 <b>Команда /accuracy доступна только в PRO-версии</b>\n\n"
-            "Верификация AI-сигналов, история точности по 1ч/4ч/24ч — "
-            "это инструмент для серьёзных трейдеров.\n\n"
-            "Стоимость PRO: <b>$29/мес</b>\n"
-            "Для подключения: @notuzo",
-            parse_mode="HTML"
-        )
-        return
-    stats = await asyncio.to_thread(_get_accuracy_stats)
+    if is_pro(message):
+        stats = await asyncio.to_thread(_get_accuracy_stats)
+    else:
+        stats = await asyncio.to_thread(_get_accuracy_stats_public)
     await message.answer(stats, parse_mode="HTML")
 
 def _get_accuracy_stats() -> str:
@@ -2006,6 +2205,51 @@ def _get_accuracy_stats() -> str:
             f"✅ Через 24ч: <b>{pct('resolved_24h')}</b>",
             "",
             "<i>Верным считается сигнал если цена двинулась в предсказанном направлении.</i>",
+        ]
+        return "\n".join(lines)
+
+def _get_accuracy_stats_public() -> str:
+    """Краткая публичная статистика точности — только 1ч и 24ч горизонты."""
+    with get_db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM predictions WHERE signal != 'watch'"
+        ).fetchone()[0]
+        if total == 0:
+            return (
+                "📊 <b>Точность AI-сигналов</b>\n\n"
+                "Предсказаний пока нет. Данные появятся после первых BUY/SELL сигналов.\n\n"
+                "🔓 Полная статистика по 7 горизонтам — /pro"
+            )
+
+        _ALLOWED_PRED_COLS = frozenset({
+            "resolved_15m", "resolved_30m", "resolved_1h", "resolved_2h",
+            "resolved_4h",  "resolved_8h",  "resolved_24h"
+        })
+
+        def pct(col: str) -> str:
+            if col not in _ALLOWED_PRED_COLS:
+                return "—"
+            row = conn.execute(
+                f"SELECT COUNT(*) as n, SUM({col}) as correct "
+                f"FROM predictions WHERE {col} IS NOT NULL"
+            ).fetchone()
+            n, correct = row
+            if n == 0:
+                return "—"
+            correct = correct or 0
+            return f"{int(correct / n * 100)}% ({int(correct)}/{n})"
+
+        lines = [
+            "📊 <b>Точность AI-сигналов</b>",
+            "",
+            f"Всего предсказаний (BUY/SELL): <b>{total}</b>",
+            "",
+            f"✅ Через  1ч: <b>{pct('resolved_1h')}</b>",
+            f"✅ Через 24ч: <b>{pct('resolved_24h')}</b>",
+            "",
+            "🔓 Полная статистика по 7 горизонтам — /pro",
+            "",
+            "#AI #WhaleWatcher",
         ]
         return "\n".join(lines)
 
