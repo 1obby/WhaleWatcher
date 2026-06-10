@@ -20,6 +20,7 @@ import time
 import requests
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from web3 import Web3
 from openai import OpenAI
 
@@ -96,7 +97,8 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 MODELSCOPE_API_KEY = os.getenv("MODELSCOPE_API_KEY")
 
 MANTLESCAN_URL = "https://mantlescan.xyz/tx/"
-DB_FILE = os.getenv("DB_FILE", "alerts.db")
+BASE_DIR = Path(__file__).parent
+DB_FILE = os.getenv("DB_FILE", str(BASE_DIR / "alerts.db"))
 
 COINGECKO_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
@@ -1169,7 +1171,7 @@ async def aggregate_and_send() -> None:
     await save_meta("alpha_signal", signal_dir)
 
     # Сохраняем батч-отчёт для Mini App
-    async def _save_batch_report():
+    def _save_batch_report():
         with get_db() as conn:
             conn.execute("""
                 INSERT INTO batch_reports
@@ -1186,8 +1188,8 @@ async def aggregate_and_send() -> None:
                 round(float(change_24h or 0), 4),
             ))
             conn.commit()
+        print(f"[BATCH] Батч-отчёт сохранён. Score={alpha_score} Signal={signal_dir}")
     await asyncio.to_thread(_save_batch_report)
-    print(f"[BATCH] Батч-отчёт сохранён. Score={alpha_score} Signal={signal_dir}")
 
     type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤", "meth_transfer": "💎"}
     type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи", "meth_transfer": "mETH Перевод"}
