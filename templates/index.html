@@ -254,7 +254,7 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
     <!-- === TASK 2: Wallets header + подзаголовок === -->
     <div class="shdr-stack">
       <div style="display:flex;align-items:center;justify-content:space-between">
-        <div class="sttl">Кошельки <span style="color:var(--t3);font-weight:400" id="w-cnt"></span></div>
+        <div class="sttl"><span data-i18n="wallets_title">Кошельки</span> <span style="color:var(--t3);font-weight:400" id="w-cnt"></span></div>
         <span class="b bsm"><i class="fa-solid fa-network-wired"></i>&nbsp;Mantle</span>
       </div>
       <div class="ssub" data-i18n="wallets_sub">Отслеживаемые адреса сети Mantle</div>
@@ -268,7 +268,7 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
       <button class="sbt on" onclick="sortW('alpha',this)" data-i18n="sort_alpha">Альфа ↓</button>
       <button class="sbt" onclick="sortW('vol',this)" data-i18n="sort_vol">Объём</button>
       <button class="sbt" onclick="sortW('txns',this)" data-i18n="sort_txns">Транзакции</button>
-      <button class="sbt" onclick="sortW('pnl',this)">PnL 30д</button>
+      <button class="sbt" onclick="sortW('pnl',this)" data-i18n="sort_pnl">PnL 30д</button>
     </div>
     <div id="w-list"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
   </div>
@@ -286,7 +286,7 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
   </div>
 
   <div class="sc" id="s4">
-    <div class="shdr"><div class="sttl" data-i18n="card_signals">СИГНАЛЫ ИИ</div><span class="b bi" id="sig-cnt">— новых</span></div>
+    <div class="shdr"><div class="sttl" data-i18n="card_signals">СИГНАЛЫ ИИ</div><span class="b bi" id="sig-cnt">—</span></div>
     <div id="sig-list"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
   </div>
 </div>
@@ -310,11 +310,16 @@ const LANG={
     accuracy:'Точность', of100:'из 100',
     stat_wallets:'кошельков', stat_txns:'транзакций',
     sort_alpha:'Альфа ↓', sort_vol:'Объём', sort_txns:'Транзакции',
+    sort_pnl:'PnL 30д',
     pbar_sub:'Сеть Mantle L2',
     type_transfer:'ПЕРЕВОД', type_swap:'СВОП',
     type_cex_in:'НА БИРЖУ', type_cex_out:'С БИРЖИ',
     type_meth:'mETH ПЕРЕВОД',
     empty_signals:'Сигналов пока нет', empty_data:'Данные накапливаются',
+    wallets_title:'Кошельки',
+    new_badge:'новых',
+    tag_transfer:'ПЕРЕВОД', tag_cex_in:'НА БИРЖУ', tag_cex_out:'С БИРЖИ', tag_swap:'СВОП',
+    tag_large:'Крупный объём', tag_dist:'DIST', tag_accum:'ACCUM',
   },
   en:{
     nav_home:'Dashboard', nav_wallets:'Wallets', nav_signals:'Signals',
@@ -326,11 +331,16 @@ const LANG={
     accuracy:'Accuracy', of100:'of 100',
     stat_wallets:'whales', stat_txns:'transactions',
     sort_alpha:'Alpha ↓', sort_vol:'Volume', sort_txns:'Transactions',
+    sort_pnl:'PnL 30d',
     pbar_sub:'Mantle L2 Network',
     type_transfer:'TRANSFER', type_swap:'SWAP',
     type_cex_in:'CEX IN', type_cex_out:'CEX OUT',
     type_meth:'mETH TRANSFER',
     empty_signals:'No signals yet', empty_data:'Data accumulating',
+    wallets_title:'Wallets',
+    new_badge:'new',
+    tag_transfer:'TRANSFER', tag_cex_in:'TO CEX', tag_cex_out:'FROM CEX', tag_swap:'SWAP',
+    tag_large:'Large volume', tag_dist:'DIST', tag_accum:'ACCUM',
   }
 };
 window._lang=localStorage.getItem('ww_lang')||'ru';
@@ -559,21 +569,23 @@ async function loadWallets(){
 }
 function fmtPnl(pnl){
   if(pnl===null||pnl===undefined)return{str:'—',cls:'cgr',label:''};
+  const L=LANG[window._lang];
   const capped=Math.max(-500,Math.min(500,pnl));
   const dots=Math.abs(pnl)>500?'…':'';
   const str=(capped>0?'+':'')+capped.toFixed(1)+'%'+dots;
-  if(pnl<-100)return{str,cls:'crd',label:'DIST'};
-  if(pnl>50)return{str,cls:'cgr',label:'ACCUM'};
+  if(pnl<-100)return{str,cls:'crd',label:L.tag_dist};
+  if(pnl>50)return{str,cls:'cgr',label:L.tag_accum};
   if(pnl===0)return{str:'0%',cls:'cmu',label:''};
   return{str,cls:pnl>0?'cgr':'crd',label:''};
 }
 function fmtNet(net){
   if(Math.abs(net||0)<0.01)return{str:'0 MNT',cls:'cmu',label:''};
+  const L=LANG[window._lang];
   const abs=Math.abs(net);
   const f=abs>=1000000?(abs/1000000).toFixed(1)+'M':abs>=1000?(abs/1000).toFixed(1)+'K':abs.toFixed(0);
   return net>0
-    ?{str:'▲ +'+f+' MNT',cls:'cgr',label:net>100?'ACCUM':''}
-    :{str:'▼ −'+f+' MNT',cls:'crd',label:net<-100?'DIST':''};
+    ?{str:'▲ +'+f+' MNT',cls:'cgr',label:net>100?L.tag_accum:''}
+    :{str:'▼ −'+f+' MNT',cls:'crd',label:net<-100?L.tag_dist:''};
 }
 /* === TASK 2: simplified Top Wallets — no addresses, only label or Wallet #N, simple flowBar === */
 function renderTop5(){
@@ -706,9 +718,9 @@ async function loadSignals(){
     const data=await fetch('/api/alerts?limit='+SIG_LIMIT+'&offset='+sigOffset+'&order=time')
       .then(r=>r.ok?r.json():Promise.reject(r.status)).catch(()=>({data:[]}));
     const alerts=data.data||[];
-    if(sigOffset===0)document.getElementById('sig-cnt').textContent=alerts.length+' новых';
+    if(sigOffset===0)document.getElementById('sig-cnt').textContent=alerts.length+' '+LANG[window._lang].new_badge;
     const ICONS={transfer:{bg:'rgba(124,58,237,.15)',c:'#a78bfa',i:'fa-arrow-right-arrow-left'},swap:{bg:'rgba(6,182,212,.15)',c:'#22d3ee',i:'fa-rotate'},cex_inflow:{bg:'rgba(16,185,129,.15)',c:'#34d399',i:'fa-building-columns'},cex_outflow:{bg:'rgba(239,68,68,.15)',c:'#f87171',i:'fa-triangle-exclamation'}};
-    const typeLabel={transfer:LANG[window._lang].type_transfer,swap:LANG[window._lang].type_swap,cex_inflow:LANG[window._lang].type_cex_in,cex_outflow:LANG[window._lang].type_cex_out,meth_transfer:LANG[window._lang].type_meth};
+    const typeLabel={transfer:LANG[window._lang].tag_transfer,swap:LANG[window._lang].tag_swap,cex_inflow:LANG[window._lang].tag_cex_in,cex_outflow:LANG[window._lang].tag_cex_out,meth_transfer:LANG[window._lang].type_meth};
     const typeBadge={transfer:'bt',swap:'bs',cex_inflow:'bi',cex_outflow:'bo'};
     function genText(a){
       const from=a.from_label||'Кошелёк';
@@ -734,7 +746,7 @@ async function loadSignals(){
           <div class="sig-tags">
             <span class="b ${sgc} b-big">${sgl}</span>
             <span class="b ${typeBadge[a.type]||'bt'}">${typeLabel[a.type]||(a.type||'unknown').toUpperCase()}</span>
-            ${(a.value_mnt||0)>1000?'<span class="b btag">Крупный объём</span>':''}
+            ${(a.value_mnt||0)>1000?`<span class="b btag">${LANG[window._lang].tag_large}</span>`:''}
           </div>
         </div>
       </div>`;
