@@ -541,6 +541,19 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ} DEFAULT NULL")
             except Exception:
                 pass  # колонка уже существует — игнорируем
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS batch_reports (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                alpha_score INTEGER DEFAULT 0,
+                signal      TEXT DEFAULT 'watch',
+                ai_text     TEXT DEFAULT '',
+                tx_count    INTEGER DEFAULT 0,
+                total_mnt   REAL DEFAULT 0,
+                mnt_price   REAL DEFAULT 0,
+                change_24h  REAL DEFAULT 0
+            )
+        """)
     conn.close()
     print(f"[DB] База данных инициализирована: {DB_FILE}")
 
@@ -1155,6 +1168,27 @@ async def aggregate_and_send() -> None:
     await save_meta("alpha_score", str(alpha_score))   # FIX-META-1: save_meta — async, to_thread недопустим
     await save_meta("alpha_signal", signal_dir)
 
+    # Сохраняем батч-отчёт для Mini App
+    async def _save_batch_report():
+        with get_db() as conn:
+            conn.execute("""
+                INSERT INTO batch_reports
+                    (timestamp, alpha_score, signal, ai_text, tx_count, total_mnt, mnt_price, change_24h)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(timezone.utc).isoformat(),
+                alpha_score,
+                signal_dir,
+                ai_signal or "",
+                len(batch),
+                round(sum(e["value_mnt"] for e in batch), 2),
+                round(float(price or 0), 4),
+                round(float(change_24h or 0), 4),
+            ))
+            conn.commit()
+    await asyncio.to_thread(_save_batch_report)
+    print(f"[BATCH] Батч-отчёт сохранён. Score={alpha_score} Signal={signal_dir}")
+
     type_icons  = {"transfer": "🔔", "swap": "🔄", "cex_inflow": "🏦📥", "cex_outflow": "🏦📤", "meth_transfer": "💎"}
     type_labels = {"transfer": "Перевод", "swap": "Своп", "cex_inflow": "На биржу", "cex_outflow": "С биржи", "meth_transfer": "mETH Перевод"}
 
@@ -1211,7 +1245,7 @@ async def aggregate_and_send() -> None:
         message = safe_cut + "\n\n<i>...сообщение обрезано</i>"
 
     # Исправление 5 — await send_telegram
-    await send_telegram(message)
+    # await send_telegram(message)   # отключено — алерты только в Mini App
     print(f"[AGG] Отчёт отправлен. Score={alpha_score} Кошельков: {len(grouped)}")
     # Сохраняем предсказание ПОСЛЕ отправки — не блокируем критический путь  # FIX-1
     if signal_dir in ("buy", "sell"):
@@ -1236,7 +1270,7 @@ async def aggregate_and_send() -> None:
                     ai_signal_raw=ai_signal,
                     horizon="15м–4ч",
                 )
-                await send_telegram(msg)
+                # await send_telegram(msg)       # отключено — AI сигнал только в Mini App
                 aggregate_and_send._last_ai_signal_key = dedup_key
                 print(f"[AI-SIG] Отправлен в чат: {signal_dir.upper()} @ ${price}")
             else:
