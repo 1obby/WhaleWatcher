@@ -82,6 +82,17 @@ def ensure_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ts   ON alerts(timestamp);
             CREATE INDEX IF NOT EXISTS idx_type ON alerts(type);
             CREATE INDEX IF NOT EXISTS idx_from ON alerts(from_addr);
+            CREATE TABLE IF NOT EXISTS batch_reports (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                alpha_score INTEGER DEFAULT 0,
+                signal      TEXT DEFAULT 'watch',
+                ai_text     TEXT DEFAULT '',
+                tx_count    INTEGER DEFAULT 0,
+                total_mnt   REAL DEFAULT 0,
+                mnt_price   REAL DEFAULT 0,
+                change_24h  REAL DEFAULT 0
+            );
         """)
     conn.close()
     print(f"[DB] OK → {DB_FILE}")
@@ -483,6 +494,22 @@ def api_wallet_spark(addr: str):
     except Exception as exc:
         app.logger.error("wallet_spark error for %s: %s", addr, exc)
         return jsonify(_EMPTY)
+
+
+@app.route("/api/batch_reports")
+def api_batch_reports():
+    limit  = int(request.args.get("limit", 20))
+    offset = int(request.args.get("offset", 0))
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT id, timestamp, alpha_score, signal, ai_text,
+                   tx_count, total_mnt, mnt_price, change_24h
+            FROM batch_reports
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    data = [dict(r) for r in rows]
+    return jsonify({"data": data, "total": len(data)})
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
