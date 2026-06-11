@@ -287,6 +287,10 @@ html,body{height:100%;background:var(--bg);color:var(--t1);overflow:hidden;font-
 
   <div class="sc" id="s4">
     <div class="shdr"><div class="sttl" data-i18n="card_signals">СИГНАЛЫ ИИ</div><span class="b bi" id="sig-cnt">—</span></div>
+    <div class="card" style="margin-bottom:.8rem;padding:1rem">
+      <div class="sttl" style="font-size:.7rem;margin-bottom:.6rem" data-i18n="chart_accuracy_title">ТОЧНОСТЬ СИГНАЛОВ</div>
+      <canvas id="accuracyChart" height="150"></canvas>
+    </div>
     <div id="sig-list"><div class="ld"><i class="fa-solid fa-spinner fa-spin"></i></div></div>
   </div>
 </div>
@@ -316,6 +320,7 @@ const LANG={
     type_cex_in:'НА БИРЖУ', type_cex_out:'С БИРЖИ',
     type_meth:'mETH ПЕРЕВОД',
     empty_signals:'Сигналов пока нет', empty_data:'Данные накапливаются',
+    chart_accuracy_title:'ТОЧНОСТЬ СИГНАЛОВ',
     wallets_title:'Кошельки',
     new_badge:'новых',
     tag_transfer:'ПЕРЕВОД', tag_cex_in:'НА БИРЖУ', tag_cex_out:'С БИРЖИ', tag_swap:'СВОП',
@@ -344,6 +349,7 @@ const LANG={
     type_cex_in:'CEX IN', type_cex_out:'CEX OUT',
     type_meth:'mETH TRANSFER',
     empty_signals:'No signals yet', empty_data:'Data accumulating',
+    chart_accuracy_title:'SIGNAL ACCURACY',
     wallets_title:'Wallets',
     new_badge:'new',
     tag_transfer:'TRANSFER', tag_cex_in:'TO CEX', tag_cex_out:'FROM CEX', tag_swap:'SWAP',
@@ -726,6 +732,45 @@ function runSim(){
   },800+Math.random()*600);
 }
 let sigOffset=0;
+async function loadAccuracyChart(){
+  try{
+    const r=await fetch('/api/accuracy');
+    const data=await r.json();
+    const horizons=data.horizons||[];
+    const labels=horizons.map(h=>h.horizon);
+    const values=horizons.map(h=>h.accuracy!==null?h.accuracy:0);
+    const ctx=document.getElementById('accuracyChart');
+    if(!ctx)return;
+    new Chart(ctx.getContext('2d'),{
+      type:'bar',
+      data:{
+        labels,
+        datasets:[{
+          data:values,
+          backgroundColor:values.map(v=>v===0?'rgba(167,139,250,0.15)':v>=60?'rgba(167,139,250,0.85)':'rgba(167,139,250,0.5)'),
+          borderColor:'rgba(167,139,250,1)',
+          borderWidth:1,
+          borderRadius:6,
+        }]
+      },
+      options:{
+        responsive:true,
+        plugins:{
+          legend:{display:false},
+          tooltip:{callbacks:{label:(c)=>{
+            const h=horizons[c.dataIndex];
+            if(!h||h.total===0)return'No data yet';
+            return`${h.accuracy}% (${h.correct}/${h.total})`;
+          }}}
+        },
+        scales:{
+          y:{min:0,max:100,ticks:{color:'#a78bfa',callback:v=>v+'%'},grid:{color:'rgba(167,139,250,0.08)'}},
+          x:{ticks:{color:'#a78bfa'},grid:{display:false}}
+        }
+      }
+    });
+  }catch(e){console.error('accuracyChart',e);}
+}
 async function loadBatchReports(){
   try{
     const L=LANG[window._lang];
@@ -799,7 +844,7 @@ function tickTimer(){
 }
 async function loadAll(h){
   if(h)hapN();
-  await Promise.all([loadStats(),loadPrice(),loadChart(),loadWallets(),loadBatchReports()]);
+  await Promise.all([loadStats(),loadPrice(),loadChart(),loadWallets(),loadBatchReports(),loadAccuracyChart()]);
   document.getElementById('ndot').style.display='block';
 }
 if(window._pollInterval)clearInterval(window._pollInterval);
