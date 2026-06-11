@@ -248,6 +248,47 @@ def api_alerts():
     return jsonify({"data": rows, "count": len(rows)})
 
 
+@app.route('/api/accuracy')
+def get_accuracy():
+    try:
+        with get_db() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM predictions WHERE signal IN ('buy', 'sell')"
+            ).fetchone()[0]
+
+            horizons = [
+                ("15m",  "resolved_15m"),
+                ("30m",  "resolved_30m"),
+                ("1h",   "resolved_1h"),
+                ("2h",   "resolved_2h"),
+                ("4h",   "resolved_4h"),
+                ("8h",   "resolved_8h"),
+                ("24h",  "resolved_24h"),
+            ]
+
+            result = []
+            for label, col in horizons:
+                row = conn.execute(
+                    f"SELECT COUNT(*) as n, SUM({col}) as correct "
+                    f"FROM predictions WHERE {col} IS NOT NULL"
+                ).fetchone()
+                n, correct = row
+                if n == 0:
+                    result.append({"horizon": label, "accuracy": None, "total": 0, "correct": 0})
+                else:
+                    correct = correct or 0
+                    result.append({
+                        "horizon": label,
+                        "accuracy": round(correct / n * 100, 1),
+                        "total": n,
+                        "correct": int(correct)
+                    })
+
+            return jsonify({"total_predictions": total, "horizons": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/stats")
 def api_stats():
     db = get_db()
