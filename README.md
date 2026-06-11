@@ -1,6 +1,6 @@
 # 🐋 WhaleWatcher — Mantle Network On-Chain Intelligence
 
-> Real-time whale tracker with AI signals, Alpha Score, and verifiable prediction accuracy — delivered via Telegram.
+> Built as a **Nansen-equivalent for Mantle Network** — real-time whale tracker with AI signals, Alpha Score, and verifiable prediction accuracy — delivered via Telegram.
 
 **Live bot:** [@whalewatcherhtBot](https://t.me/whalewatcherhtBot) | **Mini App:** [whalewatcher-production-6e1c.up.railway.app](https://whalewatcher-production-6e1c.up.railway.app/)
 
@@ -57,13 +57,28 @@ Mantle RPC (WebSocket) ──► monitor_blocks()
                     /accuracy — auto-verified vs real price
 ```
 
-**Stack:** Python 3.11 · aiogram 3.x · web3.py 6.x · SQLite WAL · Qwen AI (OpenRouter) · Flask REST API · Railway · Telegram Mini App
+**Stack:** Python 3.11 · aiogram 3.x · web3.py 6.x · SQLite WAL · Qwen AI (OpenRouter) · Flask REST API · Railway · Telegram Mini App · Solidity (WhaleLabelRegistry on Mantle)
+
+---
+
+## On-Chain Component
+
+**WhaleLabelRegistry** — smart contract deployed on Mantle Sepolia:
+[`0x67c77F393230EDBf75454C66A742D3F8d7Bc6E46`](https://explorer.sepolia.mantle.xyz/address/0x67c77F393230EDBf75454C66A742D3F8d7Bc6E46)
+
+Stores 500+ whale wallet labels on-chain. Queryable by any dApp:
+- `getLabel(address)` — get label for a single wallet
+- `getLabels(address[])` — batch query
+- `totalLabeled()` — total labeled wallets count
+
+This brings WhaleWatcher's proprietary wallet intelligence layer fully on-chain — transparent, verifiable, and composable with other Mantle protocols.
 
 ---
 
 ## Mini App
 
 4-tab interface accessible directly from Telegram:
+
 - **Dashboard** — live MNT price, TradingView chart, Alpha Score, market activity
 - **Wallets** — top whale wallets with Alpha Score, flow bars, accuracy %
 - **Paper Trading** — copy-trading simulation against MNT Hold baseline
@@ -90,33 +105,41 @@ Supports **English and Russian** interface.
 ## Freemium model
 
 - **Free** — real-time alerts, stats, /accuracy public
-- **PRO** ($29/month) — full accuracy breakdown by 7 horizons, top-10 wallets, custom thresholds
+- **PRO** ($29/month) — full accuracy breakdown by 7 horizons, top-10 wallet history, custom alert thresholds
+- **Enterprise** ($299/month) — REST API access, custom wallet watchlists, webhook integration
+
+**TAM:** 50,000+ active Mantle DeFi users
+**CAC:** ~$0 (Telegram = zero acquisition cost)
 
 ---
 
 ## Wallet tagging system
 
-500+ manually curated addresses:
+500+ manually curated addresses — a proprietary data layer built over weeks of on-chain analysis:
 
 `Mega Whale` · `OTC Distributor` · `Smart Money` · `Bybit Hot Relay` · `Personal Relay` · `Routing Wallet` · `High-frequency` · `Whale Cold Storage` · `Accumulator` · `CEX` (Bybit / OKX / KuCoin / Binance)
+
+All labels are now stored on-chain via WhaleLabelRegistry — permanently verifiable and composable.
 
 ---
 
 ## Traction
 
-- **263 verified predictions** accumulated in <24h of live monitoring
-- Accuracy tracked across 7 time horizons (15m → 24h)
-- Live since hackathon start — real data, not synthetic
+- **550+ verified predictions** accumulated since launch
+- **72% peak accuracy on 24h horizon** (89/123 predictions) — verified against real MNT price
+- Accuracy tracked across 7 time horizons (15m → 24h) via public `/accuracy` command
+- Live on Mantle mainnet — real data, not synthetic
 
 ---
 
 ## Roadmap
 
-- [ ] mETH yield tracking
-- [ ] MantleScan API enrichment  
-- [ ] Per-user alert thresholds (PRO)
-- [ ] Historical backtesting UI in Mini App
-- [ ] cmETH (Mantle Restaked ETH) monitoring
+- mETH yield tracking
+- MantleScan API enrichment
+- Per-user alert thresholds (PRO)
+- Historical backtesting UI in Mini App
+- cmETH (Mantle Restaked ETH) monitoring
+- WhaleLabelRegistry migration to Mantle mainnet
 
 ---
 
