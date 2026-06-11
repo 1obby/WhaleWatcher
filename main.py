@@ -1153,6 +1153,10 @@ async def aggregate_and_send() -> None:
     alpha_score, signal_dir = compute_alpha_score(
         batch=batch, ai_signal=ai_signal, price=price, change_24h=change_24h,
     )
+    # ПОРОГ УВЕРЕННОСТИ: BUY/SELL только при Alpha Score > 50, иначе WATCH
+    if alpha_score <= 50 and signal_dir in ("buy", "sell"):
+        signal_dir = "watch"
+        print(f"[CONF] Alpha Score {alpha_score} ≤ 50 → сигнал понижен до WATCH")
     alpha_line = format_alpha_line(alpha_score, signal_dir)
 
     # ИСПРАВЛЕНИЕ 3 — запись _last_alpha под локом для защиты от гонки с cmd_alpha
@@ -2222,6 +2226,23 @@ def _get_accuracy_stats() -> str:
             ).fetchone()
             n, correct = row
             if n == 0:
+                if col == "resolved_24h":
+                    first_row = conn.execute(
+                        "SELECT created_at FROM predictions "
+                        "WHERE signal != 'watch' ORDER BY created_at ASC LIMIT 1"
+                    ).fetchone()
+                    if first_row:
+                        try:
+                            created = datetime.fromisoformat(first_row[0])
+                            if created.tzinfo is None:
+                                created = created.replace(tzinfo=timezone.utc)
+                            ready_at = created + timedelta(hours=24)
+                            diff = ready_at - datetime.now(timezone.utc)
+                            if diff.total_seconds() > 0:
+                                hours_left = int(diff.total_seconds() / 3600) + 1
+                                return f"— (через {hours_left}ч)"
+                        except Exception:
+                            pass
                 return "—"
             correct = correct or 0  # FIX-F: SUM() возвращает None если нет подходящих строк
             return f"{int(correct / n * 100)}% ({int(correct)}/{n})"
@@ -2271,6 +2292,23 @@ def _get_accuracy_stats_public() -> str:
             ).fetchone()
             n, correct = row
             if n == 0:
+                if col == "resolved_24h":
+                    first_row = conn.execute(
+                        "SELECT created_at FROM predictions "
+                        "WHERE signal != 'watch' ORDER BY created_at ASC LIMIT 1"
+                    ).fetchone()
+                    if first_row:
+                        try:
+                            created = datetime.fromisoformat(first_row[0])
+                            if created.tzinfo is None:
+                                created = created.replace(tzinfo=timezone.utc)
+                            ready_at = created + timedelta(hours=24)
+                            diff = ready_at - datetime.now(timezone.utc)
+                            if diff.total_seconds() > 0:
+                                hours_left = int(diff.total_seconds() / 3600) + 1
+                                return f"— (через {hours_left}ч)"
+                        except Exception:
+                            pass
                 return "—"
             correct = correct or 0
             return f"{int(correct / n * 100)}% ({int(correct)}/{n})"
