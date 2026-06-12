@@ -310,16 +310,17 @@ _last_alpha: dict = {
     "price":       None,
     "change_24h":  None,
 }
-_last_alpha_lock: asyncio.Lock | None = None  # FIX-LOCK: инициализируем внутри event loop
+_last_alpha_lock = asyncio.Lock()
 
 # =============================================================================
 # ПОДКЛЮЧЕНИЕ К СЕТИ
 # =============================================================================
 
-w3 = Web3(Web3.HTTPProvider(RPC_URL))
-if not w3.is_connected():
-    raise ConnectionError(f"Не удалось подключиться к RPC: {RPC_URL}")
-print(f"[INFO] Подключено к Mantle. Последний блок: {w3.eth.block_number}")
+w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 10}))
+if w3.is_connected():
+    print(f"[INFO] Подключено к Mantle. Последний блок: {w3.eth.block_number}")
+else:
+    print(f"[WARN] RPC недоступен при старте ({RPC_URL}). Мониторинг повторит подключение.")
 
 # =============================================================================
 # ИСПРАВЛЕНИЕ 1 — Retry-обёртки для RPC-вызовов Mantle
@@ -556,6 +557,9 @@ def init_db() -> None:
                 change_24h  REAL DEFAULT 0
             )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_ts ON batch_reports(timestamp)"
+        )
     conn.close()
     print(f"[DB] База данных инициализирована: {DB_FILE}")
 
@@ -1944,10 +1948,10 @@ async def cmd_help(message: Message) -> None:
         "<b>🤖 AI сигналы BUY/SELL приходят сюда же автоматически</b>\n"
         "после крупных движений китов. Сигналы WATCH не присылаются "
         "(чтобы не спамить).\n\n"
-        "<b>Единственная команда:</b>\n"
-        f"/set_threshold N — изменить порог алертов\n"
-        f"Пример: <code>/set_threshold 100</code>\n"
-        f"Сейчас: <b>{threshold} MNT</b>\n\n"
+        "<b>Команды:</b>\n"
+        f"/set_threshold N — изменить порог алертов (сейчас: <b>{threshold} MNT</b>)\n"
+        "/verify &lt;id&gt; — проверить сигнал из batch_reports\n"
+        "/accuracy — точность AI-сигналов\n\n"
         "🌐 Dashboard — кнопка слева в поле ввода\n"
         "📬 Поддержка: @notuzo"
     )
@@ -2176,6 +2180,99 @@ async def cmd_set_threshold(message: Message) -> None:
     )
     print(f"[CFG] Порог изменён: {old_threshold} -> {new_threshold} MNT")
 
+def _get_batch_report(signal_id: int) -> dict | None:
+    """Читает запись batch_reports по id."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, timestamp, signal, mnt_price, alpha_score "
+            "FROM batch_reports WHERE id = ?",
+            (signal_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _format_signal_ts(ts_raw: str) -> str:
+    try:
+        dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return ts_raw or "—"
+
+
+def _verify_signal_result(signal: str, price_at: float, price_now: float) -> tuple[bool, float, float]:
+    """Возвращает (верно?, change_pct, profit_pct при фолловинге)."""
+    if price_at <= 0:
+        return False, 0.0, 0.0
+    change_pct = (price_now - price_at) / price_at * 100
+    if signal == "buy":
+        return change_pct > 0, change_pct, change_pct
+    # sell: профит если цена упала
+    return change_pct < 0, change_pct, -change_pct
+
+
+@dp.message(Command("verify"))
+async def cmd_verify(message: Message) -> None:
+    """Верификация сигнала из batch_reports по id."""
+    if not is_authorized(message):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer(
+            "Использование: <code>/verify &lt;signal_id&gt;</code>\n"
+            "Пример: <code>/verify 42</code>\n\n"
+            "ID — поле <b>id</b> из таблицы batch_reports (вкладка Signals в Mini App).",
+            parse_mode="HTML",
+        )
+        return
+
+    signal_id = int(parts[1].strip())
+    report = await asyncio.to_thread(_get_batch_report, signal_id)
+    if not report:
+        await message.answer(f"❌ Сигнал #{signal_id} не найден.")
+        return
+
+    signal   = (report.get("signal") or "watch").lower()
+    price_at = float(report.get("mnt_price") or 0)
+    ts_fmt   = _format_signal_ts(report.get("timestamp", ""))
+
+    if signal == "watch":
+        price_line = f" @ ${price_at:.4f}" if price_at > 0 else ""
+        await message.answer(
+            f"📊 Сигнал #{signal_id} ({ts_fmt})\n"
+            f"Тип: WATCH{price_line}\n"
+            f"⚠️ Торговый сигнал не определён — верификация невозможна."
+        )
+        return
+
+    price_now, _ = await asyncio.to_thread(get_mnt_price)
+    if not price_now or price_now <= 0:
+        await message.answer("⚠️ Не удалось получить текущую цену MNT. Попробуйте позже.")
+        return
+
+    if price_at <= 0:
+        await message.answer(
+            f"📊 Сигнал #{signal_id} ({ts_fmt})\n"
+            f"Тип: {signal.upper()}\n"
+            f"⚠️ Цена MNT на момент сигнала не сохранена — верификация невозможна."
+        )
+        return
+
+    correct, change_pct, profit_pct = _verify_signal_result(signal, price_at, price_now)
+    emoji      = "✅" if correct else "❌"
+    result_txt = "Верно" if correct else "Неверно"
+    profit_sign = "+" if profit_pct >= 0 else ""
+
+    await message.answer(
+        f"📊 Сигнал #{signal_id} ({ts_fmt})\n"
+        f"Тип: {signal.upper()} @ ${price_at:.4f}\n"
+        f"Текущая цена: ${price_now:.4f} ({change_pct:+.2f}%)\n"
+        f"Результат: {emoji} {result_txt} (профит {profit_sign}{profit_pct:.2f}%)"
+    )
+
+
 @dp.message(Command("reset_accuracy"))
 async def cmd_reset_accuracy(message: Message) -> None:
     if not is_admin(message):
@@ -2333,8 +2430,6 @@ def _get_accuracy_stats_public() -> str:
 
 if __name__ == "__main__":
     async def main() -> None:
-        global _last_alpha_lock
-        _last_alpha_lock = asyncio.Lock()  # FIX-LOCK: создаём внутри event loop, а не на уровне модуля
         init_db()   # создаём таблицы при первом запуске (idempotent)
         print("[BOT] Запуск polling и мониторинга блоков...")
         # FIX-G: включаем resolve_predictions в gather — исключения не будут молча проглочены
