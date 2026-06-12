@@ -5,13 +5,17 @@ WhaleWatcher Mini App — Flask Backend  v2
 Зависимости: pip install flask gunicorn
 """
 
+import csv
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
+from functools import wraps
+from io import StringIO
 from pathlib import Path
 
-from flask import Flask, g, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
 
 # ──────────────────────────────────────────────────────────────────────────────
 # КОНФИГ
@@ -23,6 +27,29 @@ PORT       = int(os.getenv("PORT",   5000))
 MANTLESCAN = "https://mantlescan.xyz/tx/"
 
 app = Flask(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# API CACHE — TTL 30 сек
+# ──────────────────────────────────────────────────────────────────────────────
+
+_cache: dict = {}
+
+
+def cached(ttl: int = 30):
+    """Кэширует ответ Flask-эндпоинта по path + query string."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            key = f"{request.path}?{request.query_string.decode()}"
+            now = time.time()
+            entry = _cache.get(key)
+            if entry and now - entry["ts"] < ttl:
+                return entry["response"]
+            response = f(*args, **kwargs)
+            _cache[key] = {"ts": now, "response": response}
+            return response
+        return wrapper
+    return decorator
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -93,6 +120,7 @@ def ensure_db() -> None:
                 mnt_price   REAL DEFAULT 0,
                 change_24h  REAL DEFAULT 0
             );
+            CREATE INDEX IF NOT EXISTS idx_batch_ts ON batch_reports(timestamp);
         """)
     conn.close()
     print(f"[DB] OK → {DB_FILE}")
@@ -233,9 +261,9 @@ def api_alerts():
         conds.append("value_mnt >= ?")
         p.append(min_v)
     if search:
-        s = f"%{search.lower()}%"
-        conds.append("(LOWER(from_addr) LIKE ? OR LOWER(to_addr) LIKE ? "
-                     "OR LOWER(tx_hash) LIKE ?)")
+        s = f"%{search.lower().replace('_', '\\_')}%"
+        conds.append("(LOWER(from_addr) LIKE ? ESCAPE '\\' OR LOWER(to_addr) LIKE ? ESCAPE '\\' "
+                     "OR LOWER(tx_hash) LIKE ? ESCAPE '\\')")
         p += [s, s, s]
 
     if conds:
@@ -290,6 +318,7 @@ def get_accuracy():
 
 
 @app.route("/api/stats")
+@cached(ttl=30)
 def api_stats():
     db = get_db()
 
@@ -319,13 +348,17 @@ def api_stats():
         "SELECT timestamp FROM alerts ORDER BY id DESC LIMIT 1"
     ).fetchone()
 
-    # Alpha Score из meta (пишется ботом)
-    alpha_row   = db.execute(
-        "SELECT value FROM meta WHERE key='alpha_score'"
-    ).fetchone()
-    signal_row  = db.execute(
-        "SELECT value FROM meta WHERE key='alpha_signal'"
-    ).fetchone()
+    # Alpha Score из meta (пишется ботом); fallback — последний batch_reports
+    alpha_row  = db.execute("SELECT value FROM meta WHERE key='alpha_score'").fetchone()
+    signal_row = db.execute("SELECT value FROM meta WHERE key='alpha_signal'").fetchone()
+    if not alpha_row or not signal_row:
+        batch_row = db.execute("""
+            SELECT alpha_score, signal FROM batch_reports
+            ORDER BY timestamp DESC LIMIT 1
+        """).fetchone()
+        if batch_row:
+            alpha_row  = alpha_row  or (str(batch_row["alpha_score"]),)
+            signal_row = signal_row or (batch_row["signal"],)
     thresh_row  = db.execute(
         "SELECT value FROM meta WHERE key='threshold_mnt'"
     ).fetchone()
@@ -384,6 +417,7 @@ def api_chart_hourly():
 
 
 @app.route("/api/top_wallets")
+@cached(ttl=30)
 def api_top_wallets():
     rows = get_db().execute("""
         SELECT from_addr, COUNT(*) cnt, COALESCE(SUM(value_mnt),0) vol
@@ -444,7 +478,7 @@ def api_wallet_spark(addr: str):
 
         # Убираем «0x» / «0X» для prefix-матчинга
         clean  = addr[2:] if addr.lower().startswith("0x") else addr
-        prefix = clean[:10]
+        prefix = clean[:10].replace('_', '\\_')
         like   = f"%{prefix}%"
 
         now = datetime.now(timezone.utc)
@@ -461,14 +495,14 @@ def api_wallet_spark(addr: str):
             inflow_row = db.execute("""
                 SELECT COALESCE(SUM(value_mnt), 0) AS vol
                 FROM alerts
-                WHERE to_addr LIKE ?
+                WHERE to_addr LIKE ? ESCAPE '\\'
                   AND timestamp >= ? AND timestamp < ?
             """, (like, ts0, ts1)).fetchone()
 
             outflow_row = db.execute("""
                 SELECT COALESCE(SUM(value_mnt), 0) AS vol
                 FROM alerts
-                WHERE from_addr LIKE ?
+                WHERE from_addr LIKE ? ESCAPE '\\'
                   AND timestamp >= ? AND timestamp < ?
             """, (like, ts0, ts1)).fetchone()
 
@@ -481,12 +515,12 @@ def api_wallet_spark(addr: str):
 
         total_inflow_row = db.execute("""
             SELECT COALESCE(SUM(value_mnt), 0) AS vol FROM alerts
-            WHERE to_addr LIKE ? AND timestamp >= ?
+            WHERE to_addr LIKE ? ESCAPE '\\' AND timestamp >= ?
         """, (like, period_start)).fetchone()
 
         total_outflow_row = db.execute("""
             SELECT COALESCE(SUM(value_mnt), 0) AS vol FROM alerts
-            WHERE from_addr LIKE ? AND timestamp >= ?
+            WHERE from_addr LIKE ? ESCAPE '\\' AND timestamp >= ?
         """, (like, period_start)).fetchone()
 
         total_inflow  = float(total_inflow_row["vol"])  if total_inflow_row  else 0.0
@@ -509,7 +543,7 @@ def api_wallet_spark(addr: str):
         # first_seen: самая ранняя транзакция кошелька
         first_row = db.execute("""
             SELECT MIN(timestamp) AS ts FROM alerts
-            WHERE from_addr LIKE ? OR to_addr LIKE ?
+            WHERE from_addr LIKE ? ESCAPE '\\' OR to_addr LIKE ? ESCAPE '\\'
         """, (like, like)).fetchone()
 
         first_seen = None
@@ -537,18 +571,88 @@ def api_wallet_spark(addr: str):
         return jsonify(_EMPTY)
 
 
+@app.route("/api/alpha/latest")
+def api_alpha_latest():
+    """Последний Alpha Score из batch_reports."""
+    row = get_db().execute("""
+        SELECT alpha_score, signal, timestamp
+        FROM batch_reports
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """).fetchone()
+    if not row:
+        return jsonify({"alpha_score": None, "signal": None, "timestamp": None})
+    return jsonify({
+        "alpha_score": row["alpha_score"],
+        "signal":      row["signal"],
+        "timestamp":   row["timestamp"],
+    })
+
+
+@app.route("/api/signals")
+def api_signals():
+    """Последние N сигналов из batch_reports."""
+    limit = min(max(int(request.args.get("limit", 10)), 1), 100)
+    rows = get_db().execute("""
+        SELECT id, timestamp, alpha_score, signal, total_mnt, ai_text
+        FROM batch_reports
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    data = [
+        {
+            "id":            r["id"],
+            "timestamp":     r["timestamp"],
+            "alpha_score":   r["alpha_score"],
+            "signal":        r["signal"],
+            "total_mnt":     r["total_mnt"],
+            "analysis_text": r["ai_text"],
+        }
+        for r in rows
+    ]
+    return jsonify({"data": data, "count": len(data)})
+
+
+@app.route("/api/export/csv")
+def api_export_csv():
+    """CSV-выгрузка последних 50 сигналов."""
+    rows = get_db().execute("""
+        SELECT timestamp, signal, alpha_score, total_mnt, ai_text
+        FROM batch_reports
+        ORDER BY timestamp DESC
+        LIMIT 50
+    """).fetchall()
+
+    buf = StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["timestamp", "signal", "alpha_score", "total_mnt", "analysis_text"])
+    for r in rows:
+        writer.writerow([
+            r["timestamp"],
+            r["signal"],
+            r["alpha_score"],
+            r["total_mnt"],
+            r["ai_text"],
+        ])
+
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=signals.csv"},
+    )
+
+
 @app.route("/api/batch_reports")
 def api_batch_reports():
     limit  = int(request.args.get("limit", 20))
     offset = int(request.args.get("offset", 0))
-    with get_db() as conn:
-        rows = conn.execute("""
-            SELECT id, timestamp, alpha_score, signal, ai_text,
-                   tx_count, total_mnt, mnt_price, change_24h
-            FROM batch_reports
-            ORDER BY id DESC
-            LIMIT ? OFFSET ?
-        """, (limit, offset)).fetchall()
+    rows = get_db().execute("""
+        SELECT id, timestamp, alpha_score, signal, ai_text,
+               tx_count, total_mnt, mnt_price, change_24h
+        FROM batch_reports
+        ORDER BY timestamp DESC
+        LIMIT ? OFFSET ?
+    """, (limit, offset)).fetchall()
     data = [dict(r) for r in rows]
     return jsonify({"data": data, "total": len(data)})
 
